@@ -1,0 +1,6 @@
+interface:
+  display_name: "A股 ETF PCF 指标表"
+  short_description: "生成A股ETF PCF穿透指标最终表"
+  default_prompt: "Use $a-share-etf-pcf-metrics to regenerate the final PCF look-through ETF metrics CSV and XLSX tables."
+policy:
+  allow_implicit_invocation: true

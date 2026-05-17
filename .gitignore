@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+# Generated outputs
+lookthrough-*/
+pcf-metrics-*/
+pcf_full_metrics_table.csv
+pcf_full_metrics_table.xlsx
+summary.csv
+summary.md
+*_holdings.csv
+*_lookthrough.json
+*_lookthrough.md
+
+# Runtime logs
+*.log
+*.pid

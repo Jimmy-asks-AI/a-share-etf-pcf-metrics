@@ -1,0 +1,48 @@
+# PCF look-through method
+
+Use the method below when maintaining or debugging the bundled scripts.
+
+## Holdings source priority
+
+1. Use exchange PCF creation/redemption baskets first.
+2. Use quarterly reported holdings only as fallback when PCF is unavailable.
+3. Keep the final user-facing output limited to:
+   - `pcf_full_metrics_table.xlsx`
+   - `pcf_full_metrics_table.csv`
+
+## Shanghai ETF PCF
+
+- Endpoint: `https://query.sse.com.cn/commonQuery.do`.
+- Basic SQL id: `COMMON_SSE_CP_JJLB_ETFJJGK_GGSGSHQD_JBXX_C`.
+- Component SQL id: `COMMON_SSE_CP_JJLB_ETFJJGK_GGSGSHQD_COMPONENT_C`.
+- HK marker: `UNDERLYION_SECURITY_ID == "103"`.
+- Weight: `SUBSTITUTION_CASH_AMOUNT / NAVPERCU * 100`.
+- Do not divide Shanghai `SUBSTITUTION_CASH_AMOUNT` by the premium ratio; validated baskets sum close to NAV.
+
+## Shenzhen ETF PCF
+
+- Report list endpoint: `https://www.szse.cn/api/report/ShowReport/data?CATALOGID=sgshqd`.
+- Static XML host: `https://reportdocs.static.szse.cn/files/text/ETFDown/`.
+- HK marker: `UnderlyingSecurityIDSource == "103"`.
+- If `CreationCashSubstitute > 0`, use:
+  `CreationCashSubstitute / (1 + PremiumRatio) / NAVperCU * 100`.
+- If HK rows have zero `CreationCashSubstitute`, treat them as in-kind rows and use:
+  `ComponentShare * HK spot price * HKD/CNY / NAVperCU * 100`.
+- Some SZSE download rows expose multiple XML names. Choose the XML candidate with the most HK components; some candidates contain only the cash row.
+
+## Final metrics table
+
+Sort final rows by look-through dividend yield descending. Include:
+
+- Dividend yield
+- PE using earnings-yield aggregation
+- PB
+- Annualized return
+- Sortino ratio
+- Volatility
+- Half-year return
+- One-year return
+- Three-year return
+- HK holding weight and holdings source for quality control
+
+Leave three-year return blank when the available price/NAV history is too short; do not annualize a short window and label it as three-year performance.
