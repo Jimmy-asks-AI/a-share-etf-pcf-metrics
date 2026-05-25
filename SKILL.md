@@ -9,6 +9,11 @@ description: Generate final A-share ETF PCF look-through metrics tables for Hong
 
 Use this skill to run the fixed workflow that starts from an ETF code list, performs PCF look-through for A-share listed ETFs, computes valuation and return/risk metrics, and leaves only the final CSV/XLSX tables.
 
+It also includes a standalone selected ETF workflow for user-specified ETF
+portfolios. That script can look through A-share and Hong Kong constituents,
+then compute ETF-level and portfolio-level dividend yield, PE, PB, return,
+volatility, and Sortino metrics without model assistance.
+
 Default final outputs:
 
 - `pcf_full_metrics_table.xlsx`
@@ -29,6 +34,20 @@ Useful options:
 - `--etf 513690,159569`: run explicit ETF codes and ignore the default input CSV.
 - `--out-dir <dir>`: output directory; default is `lookthrough-hk-all-ranking-pcf-risk`.
 - `--keep-intermediates`: keep per-ETF reports, holdings files, and `summary.csv` for debugging.
+
+Run selected ETF or ETF portfolio look-through:
+
+```powershell
+python C:\Users\81901\.codex\skills\a-share-etf-pcf-metrics\scripts\selected_etf_lookthrough.py --etf 159569,159758 --weights 60,40 --out-dir selected-etf-output
+```
+
+Selected workflow outputs:
+
+- `metrics_summary.csv`: ETF rows plus one `PORTFOLIO` row.
+- `lookthrough_summary.csv`: aggregated underlying stock exposure.
+- `lookthrough_detail.csv`: per-ETF underlying holdings with stock PE/PB/dividend yield.
+- `etf_summary.csv`: ETF holding-source and metric summary.
+- `lookthrough_report.xlsx`: workbook containing all sheets.
 
 ## Workflow
 

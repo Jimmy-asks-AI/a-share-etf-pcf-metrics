@@ -57,6 +57,27 @@ Keep intermediate per-ETF reports for debugging:
 python C:\Users\81901\.codex\skills\a-share-etf-pcf-metrics\scripts\run_pcf_metrics.py --keep-intermediates
 ```
 
+Run selected ETFs or an ETF portfolio:
+
+```powershell
+python C:\Users\81901\.codex\skills\a-share-etf-pcf-metrics\scripts\selected_etf_lookthrough.py --etf 159569,159758 --weights 60,40 --out-dir selected-etf-output
+```
+
+This standalone script supports both single ETF and weighted portfolio
+look-through. It exports underlying stock weights, stock-level PE/PB/dividend
+yield, ETF-level metrics, and a `PORTFOLIO` row whose valuation metrics are
+aggregated from underlying stock weights. Portfolio return, volatility, and
+Sortino are calculated from the combined ETF NAV/price history instead of from
+weighted precomputed ETF table values.
+
+Selected workflow outputs:
+
+- `metrics_summary.csv`
+- `lookthrough_summary.csv`
+- `lookthrough_detail.csv`
+- `etf_summary.csv`
+- `lookthrough_report.xlsx`
+
 ## Example Output
 
 Excerpt from `pcf_full_metrics_table.csv`:
@@ -87,4 +108,3 @@ After installing the folder into `~/.codex/skills` or `~/.claude/skills`, invoke
 ```text
 用 a-share-etf-pcf-metrics 重新生成 ETF PCF 穿透指标表
 ```
-
