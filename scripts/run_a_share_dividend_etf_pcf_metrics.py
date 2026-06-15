@@ -26,6 +26,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 import pandas as pd
 import requests
 
+from pcf_common import (
+    annualized_return as common_annualized_return,
+    earnings_yield_pe as common_earnings_yield_pe,
+    normalize_price_frame as common_normalize_price_frame,
+    weighted_average as common_weighted_average,
+)
+
 try:
     import akshare as ak
 except ImportError as exc:
@@ -65,8 +72,9 @@ def retry_call(label: str, func, attempts: int = 4, delay: float = 2.0):
 def clean_float(value: Any) -> float | None:
     if value is None:
         return None
-    if isinstance(value, float) and math.isnan(value):
-        return None
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
     text = (
         str(value)
         .strip()
@@ -76,14 +84,17 @@ def clean_float(value: Any) -> float | None:
         .replace("￥", "")
         .replace("¥", "")
     )
-    if text in {"", "-", "--", "None", "nan", "NaN", "NaT"}:
+    if text in {"", "-", "--", "None", "nan", "NaN", "NaT", "inf", "-inf", "Infinity", "-Infinity"}:
         return None
     if text.endswith("%"):
         text = text[:-1]
     try:
-        return float(text)
+        number = float(text)
     except ValueError:
         return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return number
 
 
 def parse_jsonp(text: str) -> dict[str, Any]:
@@ -128,9 +139,10 @@ def code_market(code: str) -> str:
 
 
 def is_a_stock_code(code: str) -> bool:
-    code = normalize_stock_code(code)
-    if len(code) != 6:
+    raw = re.sub(r"\D", "", str(code))
+    if len(raw) != 6:
         return False
+    code = raw
     if code.startswith(("15", "16", "18", "50", "51", "52", "56", "58")):
         return False
     return code.startswith(("000", "001", "002", "003", "300", "301", "6", "8", "4"))
@@ -177,7 +189,7 @@ def load_a_stock_snapshot() -> dict[str, dict[str, Any]]:
     name_col = column(df, ["名称"], 1)
     price_col = column(df, ["最新价"], 2)
     print("Loading A-share price snapshot...")
-    snapshot = load_a_stock_snapshot()
+    snapshot: dict[str, dict[str, Any]] = {}
     for _, row in df.iterrows():
         code = normalize_stock_code(row.get(code_col))
         if not code:
@@ -525,54 +537,19 @@ def enrich_dividend_yields(snapshot: dict[str, dict[str, Any]], codes: list[str]
 
 
 def weighted_average(rows: list[dict[str, Any]], key: str, positive_only: bool = False) -> tuple[float | None, float]:
-    total_weight = 0.0
-    total = 0.0
-    for row in rows:
-        value = row.get(key)
-        weight = row.get("weight_pct") or 0.0
-        if value is None or (isinstance(value, float) and math.isnan(value)):
-            continue
-        if positive_only and value <= 0:
-            continue
-        total += weight * value
-        total_weight += weight
-    if total_weight <= 0:
-        return None, 0.0
-    return total / total_weight, total_weight
+    return common_weighted_average(rows, key, positive_only=positive_only)
 
 
 def earnings_yield_pe(rows: list[dict[str, Any]]) -> tuple[float | None, float, float]:
-    total_weight = 0.0
-    earnings_yield = 0.0
-    negative_weight = 0.0
-    for row in rows:
-        pe = row.get("pe")
-        weight = row.get("weight_pct") or 0.0
-        if pe is None or (isinstance(pe, float) and math.isnan(pe)):
-            continue
-        if pe <= 0:
-            negative_weight += weight
-            continue
-        earnings_yield += weight / pe
-        total_weight += weight
-    if total_weight <= 0 or earnings_yield <= 0:
-        return None, total_weight, negative_weight
-    return total_weight / earnings_yield, total_weight, negative_weight
+    return common_earnings_yield_pe(rows)
 
 
 def annualized_return(first_value: float, last_value: float, first_date: date, last_date: date) -> float | None:
-    days = (last_date - first_date).days
-    if days <= 0 or first_value <= 0:
-        return None
-    return (last_value / first_value) ** (365.25 / days) - 1
+    return common_annualized_return(first_value, last_value, first_date, last_date)
 
 
 def normalize_price_frame(df: pd.DataFrame, date_col: str, value_col: str) -> pd.DataFrame:
-    temp = df[[date_col, value_col]].copy()
-    temp.columns = ["date", "value"]
-    temp["date"] = pd.to_datetime(temp["date"], errors="coerce")
-    temp["value"] = pd.to_numeric(temp["value"], errors="coerce")
-    return temp.dropna().sort_values("date")
+    return common_normalize_price_frame(df, date_col, value_col)
 
 
 def summarize_period_return(temp: pd.DataFrame, days: int) -> float | None:
@@ -665,11 +642,35 @@ def build_metrics_for_etf(
     name: str,
     metrics: dict[str, dict[str, Any]],
     min_a_weight: float,
+    implied_prices: dict[str, float] | None = None,
+    holdings: pd.DataFrame | None = None,
+    period: str = "",
+    source: str = "",
 ) -> tuple[dict[str, Any] | None, pd.DataFrame | None, str | None]:
     try:
-        holdings, period, source = get_pcf_holdings(etf, {})
+        if holdings is None:
+            holdings, period, source = get_pcf_holdings(etf, {"price": p for p in (implied_prices or {}) if False} or {})
+        holdings = holdings.copy()
         holdings["权重%"] = pd.to_numeric(holdings["权重%"], errors="coerce")
+        if implied_prices:
+            fill_mask = (
+                holdings["市场"].isin(A_MARKETS)
+                & holdings["股票代码"].astype(str).map(is_a_stock_code)
+                & holdings["权重%"].isna()
+            )
+            for idx, h in holdings.loc[fill_mask].iterrows():
+                code = normalize_stock_code(h["股票代码"])
+                quantity = clean_float(h.get("数量"))
+                price = implied_prices.get(code)
+                nav_per_cu = clean_float(h.get("NAVperCU"))
+                if quantity and price and nav_per_cu:
+                    amount = quantity * price
+                    holdings.at[idx, "市值"] = amount
+                    holdings.at[idx, "隐含价格"] = price
+                    holdings.at[idx, "权重%"] = amount / nav_per_cu * 100
+                    holdings.at[idx, "权重来源"] = "ComponentShare*implied price/NAVperCU"
         a_holdings = holdings[holdings["市场"].isin(A_MARKETS) & holdings["股票代码"].astype(str).map(is_a_stock_code)].copy()
+        a_holdings["权重%"] = pd.to_numeric(a_holdings["权重%"], errors="coerce")
         a_weight = float(a_holdings["权重%"].sum())
         if a_weight < min_a_weight:
             return None, holdings, f"A-share PCF weight below threshold: {a_weight:.2f}%"
@@ -824,57 +825,23 @@ def main() -> int:
     # Reuse already downloaded holdings by calculating directly.
     for etf, name, holdings, period, source in preliminary:
         print(f"Calculating {etf} {name}...")
-        try:
-            a_holdings = holdings[holdings["市场"].isin(A_MARKETS) & holdings["股票代码"].astype(str).map(is_a_stock_code)].copy()
-            a_weight = float(pd.to_numeric(a_holdings["权重%"], errors="coerce").sum())
-            if a_weight < args.min_a_weight:
-                errors.append({"ETF代码": etf, "ETF名称": name, "说明": f"非A股底层或A股权重不足: {a_weight:.2f}%"})
-                continue
-            rows = []
-            for _, h in a_holdings.iterrows():
-                code = normalize_stock_code(h["股票代码"])
-                stock = metrics.get(code) or {}
-                rows.append(
-                    {
-                        "code": code,
-                        "weight_pct": clean_float(h["权重%"]) or 0.0,
-                        "pe": stock.get("pe"),
-                        "pb": stock.get("pb"),
-                        "dividend_yield_pct": stock.get("dividend_yield_pct"),
-                    }
-                )
-            pe, pe_cov, neg_pe = earnings_yield_pe(rows)
-            pb, pb_cov = weighted_average(rows, "pb", positive_only=True)
-            dy, dy_cov = weighted_average(rows, "dividend_yield_pct")
-            returns = get_returns(etf)
-            results.append(
-                {
-                    "ETF代码": etf,
-                    "ETF名称": name,
-                    "持仓期": period,
-                    "持仓来源": source,
-                    "A股持仓权重%": a_weight,
-                    "股票持仓数": len(a_holdings),
-                    "股息率%": dy,
-                    "PE": pe,
-                    "PB": pb,
-                    "年化收益%": returns.get("annualized_return_pct"),
-                    "索提诺比率": returns.get("sortino_ratio"),
-                    "波动率%": returns.get("volatility_pct"),
-                    "近半年收益%": returns.get("half_year_return_pct"),
-                    "近一年收益%": returns.get("one_year_return_pct"),
-                    "近3年收益%": returns.get("three_year_return_pct"),
-                    "收益来源": returns.get("source"),
-                    "收益区间": returns.get("return_window"),
-                    "风险指标区间": returns.get("risk_window"),
-                    "PE覆盖权重%": pe_cov,
-                    "股息率覆盖权重%": dy_cov,
-                    "PB覆盖权重%": pb_cov,
-                    "负PE权重%": neg_pe,
-                }
-            )
-        except Exception as exc:
-            errors.append({"ETF代码": etf, "ETF名称": name, "说明": str(exc)})
+        result, _, error = build_metrics_for_etf(
+            etf,
+            name,
+            metrics,
+            args.min_a_weight,
+            implied_prices=implied_prices,
+            holdings=holdings,
+            period=period,
+            source=source,
+        )
+        if error:
+            errors.append({"ETF代码": etf, "ETF名称": name, "说明": error})
+            continue
+        if result is None:
+            errors.append({"ETF代码": etf, "ETF名称": name, "说明": "A-share ETF 指标计算未产出结果"})
+            continue
+        results.append(result)
         time.sleep(args.sleep)
 
     report = pd.DataFrame(results)

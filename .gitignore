@@ -4,8 +4,16 @@ __pycache__/
 # Generated outputs
 lookthrough-*/
 pcf-metrics-*/
+selected-etf-output*/
+selected_etf_*output*/
+selected_etf_*smoke*/
 pcf_full_metrics_table.csv
 pcf_full_metrics_table.xlsx
+metrics_summary.csv
+lookthrough_summary.csv
+lookthrough_detail.csv
+etf_summary.csv
+lookthrough_report.xlsx
 summary.csv
 summary.md
 *_holdings.csv

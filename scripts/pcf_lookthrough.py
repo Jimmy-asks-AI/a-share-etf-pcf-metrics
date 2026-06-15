@@ -20,6 +20,13 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import requests
 
+from pcf_common import (
+    annualized_return as common_annualized_return,
+    earnings_yield_pe as common_earnings_yield_pe,
+    normalize_price_frame as common_normalize_price_frame,
+    weighted_average as common_weighted_average,
+)
+
 try:
     import akshare as ak
 except ImportError as exc:  # pragma: no cover - environment guard
@@ -135,7 +142,9 @@ def clean_percent(value: Any) -> float | None:
     number = clean_float(value)
     if number is None:
         return None
-    return number / 100 if "%" in str(value) else number
+    if "%" in str(value) or abs(number) > 1:
+        return number / 100
+    return number
 
 
 def normalize_hk_code(value: Any) -> str:
@@ -154,24 +163,35 @@ def parse_jsonp(text: str) -> dict[str, Any]:
     return json.loads(match.group(1))
 
 
-def request_json(url: str, *, params: dict[str, Any] | None = None, referer: str = "") -> Any:
+def request_json(url: str, *, params: dict[str, Any] | None = None, referer: str = "", attempts: int = 3) -> Any:
+    text = request_text(url, params=params, referer=referer, attempts=attempts)
+    return json.loads(text)
+
+
+def request_text(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    referer: str = "",
+    attempts: int = 3,
+    delay: float = 1.0,
+) -> str:
     headers = dict(HTTP_HEADERS)
     if referer:
         headers["Referer"] = referer
-    response = requests.get(url, params=params, headers=headers, timeout=25)
-    response.raise_for_status()
-    return response.json()
-
-
-def request_text(url: str, *, params: dict[str, Any] | None = None, referer: str = "") -> str:
-    headers = dict(HTTP_HEADERS)
-    if referer:
-        headers["Referer"] = referer
-    response = requests.get(url, params=params, headers=headers, timeout=25)
-    response.raise_for_status()
-    if response.encoding is None or response.encoding.lower() == "iso-8859-1":
-        response.encoding = response.apparent_encoding or "utf-8"
-    return response.text
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=25)
+            response.raise_for_status()
+            if response.encoding is None or response.encoding.lower() == "iso-8859-1":
+                response.encoding = response.apparent_encoding or "utf-8"
+            return response.text
+        except Exception as exc:  # noqa: BLE001 - remote data sources fail transiently
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(delay * attempt)
+    raise last_exc or RuntimeError(f"request failed: {url}")
 
 
 def make_holdings_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -588,22 +608,15 @@ def is_stale(date_text: str, max_age_days: int = 180) -> bool:
 
 
 def annualized_return(first_value: float, last_value: float, first_date: date, last_date: date) -> float | None:
-    days = (last_date - first_date).days
-    if first_value <= 0 or last_value <= 0 or days <= 0:
-        return None
-    return (last_value / first_value) ** (365.0 / days) - 1.0
+    return common_annualized_return(first_value, last_value, first_date, last_date)
 
 
 def normalize_price_frame(df: pd.DataFrame, date_col: str, value_col: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["date", "value"])
-    temp = df.copy()
-    if date_col not in temp.columns or value_col not in temp.columns:
+    if date_col not in df.columns or value_col not in df.columns:
         return pd.DataFrame(columns=["date", "value"])
-    temp["date"] = pd.to_datetime(temp[date_col], errors="coerce")
-    temp["value"] = pd.to_numeric(temp[value_col], errors="coerce")
-    temp = temp.dropna(subset=["date", "value"]).sort_values("date")
-    return temp[["date", "value"]]
+    return common_normalize_price_frame(df, date_col, value_col)
 
 
 def value_window(temp: pd.DataFrame, days_back: int, min_days: int) -> dict[str, Any]:
@@ -731,36 +744,13 @@ def get_returns(etf: str) -> dict[str, Any]:
 
 
 def weighted_average(items: list[HoldingMetric], attr: str, positive_only: bool = False) -> tuple[float | None, float]:
-    total_weight = 0.0
-    total = 0.0
-    for item in items:
-        value = getattr(item, attr)
-        if value is None:
-            continue
-        if positive_only and value <= 0:
-            continue
-        total += item.weight_pct * value
-        total_weight += item.weight_pct
-    if total_weight <= 0:
-        return None, 0.0
-    return total / total_weight, total_weight
+    rows = [{"weight_pct": item.weight_pct, attr: getattr(item, attr)} for item in items]
+    return common_weighted_average(rows, attr, positive_only=positive_only)
 
 
 def earnings_yield_pe(items: list[HoldingMetric]) -> tuple[float | None, float, float]:
-    total_weight = 0.0
-    earnings_yield = 0.0
-    negative_weight = 0.0
-    for item in items:
-        if item.pe is None:
-            continue
-        if item.pe <= 0:
-            negative_weight += item.weight_pct
-            continue
-        earnings_yield += item.weight_pct / item.pe
-        total_weight += item.weight_pct
-    if total_weight <= 0 or earnings_yield <= 0:
-        return None, total_weight, negative_weight
-    return total_weight / earnings_yield, total_weight, negative_weight
+    rows = [{"weight_pct": item.weight_pct, "pe": item.pe} for item in items]
+    return common_earnings_yield_pe(rows)
 
 
 def summarize(items: list[HoldingMetric]) -> dict[str, Any]:

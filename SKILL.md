@@ -1,44 +1,60 @@
 ---
 name: a-share-etf-pcf-metrics
-description: Generate final A-share ETF PCF look-through metrics tables for Hong Kong/H-share/Hang Seng exposure, including dividend yield, PE, PB, annualized return, Sortino ratio, volatility, half-year/one-year/three-year returns, and HK holding coverage. Use when the user asks to rerun the ETF look-through workflow, update pcf_full_metrics_table.csv/xlsx, rank A-share listed Hong Kong ETFs by dividends or valuation, or reproduce the cleaned final output table without keeping intermediate per-ETF files.
+description: Generate A-share listed ETF PCF look-through metric tables, including dividend yield, PE, PB, annualized return, Sortino ratio, volatility, half-year/one-year/three-year returns, and holding coverage. Use for Hong Kong/H-share/Hang Seng ETF ranking, A-share dividend ETF look-through, or selected ETF portfolio look-through without model-based calculation.
 ---
 
 # A-share ETF PCF Metrics
 
 ## Overview
 
-Use this skill to run the fixed workflow that starts from an ETF code list, performs PCF look-through for A-share listed ETFs, computes valuation and return/risk metrics, and leaves only the final CSV/XLSX tables.
+Use this skill when the user wants deterministic PCF look-through calculations for A-share listed ETFs. The bundled scripts read exchange PCF baskets, compute constituent-level valuation/dividend data, and aggregate ETF or portfolio metrics.
 
-It also includes a standalone selected ETF workflow for user-specified ETF
-portfolios. That script can look through A-share and Hong Kong constituents,
-then compute ETF-level and portfolio-level dividend yield, PE, PB, return,
-volatility, and Sortino metrics without model assistance.
+Two workflows are supported:
+
+- Batch HK ETF ranking: `scripts/run_pcf_metrics.py`
+- Selected ETF or ETF portfolio look-through: `scripts/selected_etf_lookthrough.py`
+
+Resolve the skill directory first. `$SKILL_DIR` means the directory containing this `SKILL.md`; if the current directory is the skill/repo directory, use:
+
+```powershell
+$SKILL_DIR = Resolve-Path .
+```
+
+## Batch HK ETF Ranking
+
+Run explicit ETF codes:
+
+```powershell
+python "$SKILL_DIR\scripts\run_pcf_metrics.py" --etf 513690,159569 --out-dir pcf-metrics-output
+```
+
+Run from a CSV list:
+
+```powershell
+python "$SKILL_DIR\scripts\run_pcf_metrics.py" --input ".\my_etf_list.csv" --code-column "ETF代码" --out-dir pcf-metrics-output
+```
+
+The default input is `lookthrough-hk-all-ranking/all_etf_summary.csv`. That file is not bundled; it must already exist from the earlier HK ETF discovery workflow. If it is missing, pass explicit `--etf` codes or generate the discovery CSV first.
 
 Default final outputs:
 
 - `pcf_full_metrics_table.xlsx`
 - `pcf_full_metrics_table.csv`
 
-## Quick Start
+By default, intermediate per-ETF CSV/JSON/MD files are removed. Use `--keep-intermediates` while debugging, auditing, or validating source data.
 
-From the workspace containing `lookthrough-hk-all-ranking/all_etf_summary.csv`:
+## Selected ETF Portfolio
+
+Run a single ETF:
 
 ```powershell
-python C:\Users\81901\.codex\skills\a-share-etf-pcf-metrics\scripts\run_pcf_metrics.py
+python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 159569 --out-dir selected-etf-output
 ```
 
-Useful options:
-
-- `--input <csv>`: source ETF list; default is `lookthrough-hk-all-ranking/all_etf_summary.csv`.
-- `--code-column <name>`: ETF code column; default is `ETF代码`.
-- `--etf 513690,159569`: run explicit ETF codes and ignore the default input CSV.
-- `--out-dir <dir>`: output directory; default is `lookthrough-hk-all-ranking-pcf-risk`.
-- `--keep-intermediates`: keep per-ETF reports, holdings files, and `summary.csv` for debugging.
-
-Run selected ETF or ETF portfolio look-through:
+Run a weighted ETF portfolio:
 
 ```powershell
-python C:\Users\81901\.codex\skills\a-share-etf-pcf-metrics\scripts\selected_etf_lookthrough.py --etf 159569,159758 --weights 60,40 --out-dir selected-etf-output
+python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 159569,159758 --weights 60,40 --out-dir selected-etf-output
 ```
 
 Selected workflow outputs:
@@ -49,56 +65,57 @@ Selected workflow outputs:
 - `etf_summary.csv`: ETF holding-source and metric summary.
 - `lookthrough_report.xlsx`: workbook containing all sheets.
 
-## Workflow
+`--weights` accepts percentages or decimals and is normalized internally. If omitted, ETFs are equal weighted. `--markets` can force `auto`, `hk`, or `a`; use `auto` unless the parser chooses the wrong market.
 
-1. Read ETF codes from the prior collection table or explicit `--etf` values.
-2. Run `scripts/pcf_lookthrough.py` with:
-   - `--holdings-source auto`
-   - `--alt-limit 0`
-   - `--sleep 0`
-3. Generate the final Chinese metrics table with `scripts/run_pcf_metrics.py`.
-4. Unless debugging, delete intermediate single-ETF CSV/JSON/MD outputs and script summaries.
-5. Return links to only the final `.xlsx` and `.csv` files.
+## Metric Rules
 
-## Metrics
-
-The final table includes:
-
-- Dividend yield: look-through weighted constituent dividend yield.
-- PE: earnings-yield aggregation PE.
-- PB: weighted PB over covered positive PB constituents.
-- Annualized return: preferred source from ETF NAV/price history.
-- Sortino ratio and volatility: recent daily-return risk metrics.
-- Half-year, one-year, and three-year return.
-- HK holding weight and holding source for quality control.
-
-Leave three-year return blank when available history is too short; do not label a short window as a three-year return.
+- Dividend yield: weighted look-through constituent dividend yield.
+- PE: earnings-yield aggregation (`sum(weight) / sum(weight / PE)`), ignoring non-positive PE in the denominator and reporting negative PE coverage.
+- PB: weighted average over covered positive PB constituents.
+- ETF annualized return, volatility, and Sortino: preferred ETF NAV/price history source.
+- Portfolio annualized return, volatility, and Sortino: calculated from the combined ETF NAV/price curve, not from weighted precomputed ETF metrics.
+- Three-year return stays blank when available history is too short.
 
 ## PCF Rules
 
-Read `references/pcf-method.md` when modifying source priority or weight calculations. Critical rules from prior validation:
+Read `references/pcf-method.md` before changing source priority or weight formulas. Critical rules:
 
-- Shanghai ETF PCF: use `SUBSTITUTION_CASH_AMOUNT / NAVPERCU`.
-- Shenzhen ETF cash-substitute rows: use `CreationCashSubstitute / (1 + PremiumRatio) / NAVperCU`.
-- Shenzhen in-kind HK rows with zero substitute cash: use `ComponentShare * HK spot price * HKD/CNY / NAVperCU`.
-- For Shenzhen rows with multiple downloadable XML candidates, choose the candidate with the most HK components.
+- Shanghai ETF PCF: `SUBSTITUTION_CASH_AMOUNT / NAVPERCU`.
+- Shenzhen cash-substitute rows: `CreationCashSubstitute / (1 + PremiumRatio) / NAVperCU`.
+- Shenzhen in-kind HK rows with zero substitute cash: `ComponentShare * HK spot price * HKD/CNY / NAVperCU`.
+- When a Shenzhen download row exposes multiple XML candidates, choose the XML with the most relevant stock components.
+
+## References
+
+Load only the file needed for the current task:
+
+- `references/pcf-method.md`: data source priority and PCF formulas.
+- `references/output-schema.md`: column definitions, units, and null semantics.
+- `references/troubleshooting.md`: network/data-source failures and diagnostics.
 
 ## Dependencies
 
-Install missing packages only if needed:
+Install missing packages only when needed:
 
 ```powershell
-python -m pip install akshare pandas requests openpyxl tabulate
+python -m pip install -r "$SKILL_DIR\requirements.txt"
 ```
 
-Network access is required for exchange PCF, HK valuation, HK spot price, FX rate, and ETF return data.
+Network access is required for exchange PCF files, stock valuation/dividend data, HK spot prices, HKD/CNY FX quotes, and ETF return histories.
 
 ## Validation
 
-For a quick smoke test, run:
+Fast offline checks:
 
 ```powershell
-python C:\Users\81901\.codex\skills\a-share-etf-pcf-metrics\scripts\run_pcf_metrics.py --etf 513690,159569 --out-dir pcf-metrics-smoke-test
+python -m py_compile "$SKILL_DIR\scripts\run_pcf_metrics.py" "$SKILL_DIR\scripts\pcf_lookthrough.py" "$SKILL_DIR\scripts\run_a_share_dividend_etf_pcf_metrics.py" "$SKILL_DIR\scripts\selected_etf_lookthrough.py"
+python -m unittest discover -s "$SKILL_DIR\tests"
 ```
 
-Expected: two final files and no intermediate files unless `--keep-intermediates` is set.
+Network smoke test:
+
+```powershell
+python "$SKILL_DIR\scripts\run_pcf_metrics.py" --etf 513690,159569 --out-dir pcf-metrics-smoke-test
+```
+
+Expected batch result: final `.csv` and `.xlsx`; intermediate files only when `--keep-intermediates` is set.

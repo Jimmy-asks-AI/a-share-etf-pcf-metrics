@@ -13,21 +13,22 @@ import pandas as pd
 
 FINAL_CSV = "pcf_full_metrics_table.csv"
 FINAL_XLSX = "pcf_full_metrics_table.xlsx"
+DEFAULT_INPUT = "lookthrough-hk-all-ranking/all_etf_summary.csv"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input",
-        default="lookthrough-hk-all-ranking/all_etf_summary.csv",
-        help="CSV containing ETF codes. Defaults to the prior all_etf_summary.csv location.",
+        default=DEFAULT_INPUT,
+        help=f"CSV containing ETF codes. Defaults to {DEFAULT_INPUT}.",
     )
     parser.add_argument("--code-column", default="ETF代码", help="ETF code column in --input.")
     parser.add_argument("--etf", action="append", help="ETF code. Repeat or use comma-separated values. When set, --input is ignored.")
     parser.add_argument("--out-dir", default="lookthrough-hk-all-ranking-pcf-risk", help="Output directory.")
     parser.add_argument("--holdings-source", choices=("auto", "pcf", "reported"), default="auto")
     parser.add_argument("--alt-limit", type=int, default=0)
-    parser.add_argument("--sleep", type=float, default=0.0)
+    parser.add_argument("--sleep", type=float, default=0.05, help="Sleep seconds between constituent valuation requests.")
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep per-ETF reports and summary files.")
     return parser.parse_args()
@@ -44,7 +45,13 @@ def load_codes(args: argparse.Namespace) -> list[str]:
             raise SystemExit(f"Input CSV missing code column: {args.code_column}")
         codes.extend(str(value).strip() for value in df[args.code_column].dropna())
     if not codes:
-        raise SystemExit("No ETF codes found. Provide --etf or a valid --input CSV.")
+        if str(input_path).replace("\\", "/") == DEFAULT_INPUT:
+            raise SystemExit(
+                "No ETF codes found. Provide --etf, or generate the default input first at "
+                f"{DEFAULT_INPUT}. The default input is produced by the earlier HK ETF discovery "
+                "workflow; for an explicit run use: python scripts/run_pcf_metrics.py --etf 513690,159569"
+            )
+        raise SystemExit(f"No ETF codes found. Provide --etf or a valid --input CSV: {input_path}")
     return [code.zfill(6) for code in dict.fromkeys(codes)]
 
 

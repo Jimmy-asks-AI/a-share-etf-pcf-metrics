@@ -10,6 +10,13 @@ Use the method below when maintaining or debugging the bundled scripts.
    - `pcf_full_metrics_table.xlsx`
    - `pcf_full_metrics_table.csv`
 
+## Trading date awareness
+
+- PCF files are exchange-published basket files and may reflect the latest available trading day, not necessarily the calendar date when the script is run.
+- Always preserve the PCF period in output columns such as `持仓期`.
+- A-share and Hong Kong holidays can differ. When markets are closed or one market is on holiday, the latest PCF/price/valuation source can be stale by one or more calendar days.
+- Do not overwrite source dates with the run date; report source windows explicitly.
+
 ## Shanghai ETF PCF
 
 - Endpoint: `https://query.sse.com.cn/commonQuery.do`.
@@ -46,3 +53,5 @@ Sort final rows by look-through dividend yield descending. Include:
 - HK holding weight and holdings source for quality control
 
 Leave three-year return blank when the available price/NAV history is too short; do not annualize a short window and label it as three-year performance.
+
+For column definitions and null semantics, read `output-schema.md`.

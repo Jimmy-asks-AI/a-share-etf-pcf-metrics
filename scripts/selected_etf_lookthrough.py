@@ -22,6 +22,12 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from pcf_common import (
+    annualized_return as common_annualized_return,
+    earnings_yield_pe as common_earnings_yield_pe,
+    weighted_average as common_weighted_average,
+)
+
 
 WORKSPACE = Path(__file__).resolve().parent
 DEFAULT_A_SCRIPT = WORKSPACE / "run_a_share_dividend_etf_pcf_metrics.py"
@@ -320,39 +326,11 @@ def first_valid(values: pd.Series) -> Any:
 
 
 def weighted_average_metric(rows: list[dict[str, Any]], key: str, positive_only: bool = False) -> tuple[float | None, float]:
-    total_weight = 0.0
-    total = 0.0
-    for row in rows:
-        value = as_float(row.get(key))
-        weight = as_float(row.get("weight_pct")) or 0.0
-        if value is None:
-            continue
-        if positive_only and value <= 0:
-            continue
-        total += weight * value
-        total_weight += weight
-    if total_weight <= 0:
-        return None, 0.0
-    return total / total_weight, total_weight
+    return common_weighted_average(rows, key, positive_only=positive_only)
 
 
 def earnings_yield_pe_metric(rows: list[dict[str, Any]]) -> tuple[float | None, float, float]:
-    total_weight = 0.0
-    earnings_yield = 0.0
-    negative_weight = 0.0
-    for row in rows:
-        pe = as_float(row.get("pe"))
-        weight = as_float(row.get("weight_pct")) or 0.0
-        if pe is None:
-            continue
-        if pe <= 0:
-            negative_weight += weight
-            continue
-        earnings_yield += weight / pe
-        total_weight += weight
-    if total_weight <= 0 or earnings_yield <= 0:
-        return None, total_weight, negative_weight
-    return total_weight / earnings_yield, total_weight, negative_weight
+    return common_earnings_yield_pe(rows)
 
 
 def aggregate_valuation_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -451,10 +429,8 @@ def fetch_etf_price_series(ak_module: Any, etf: str, lookback_days: int) -> tupl
 
 
 def annualized_from_values(first_value: float, last_value: float, first_date: date, last_date: date) -> float | None:
-    days = (last_date - first_date).days
-    if days <= 0 or first_value <= 0 or last_value <= 0:
-        return None
-    return ((last_value / first_value) ** (365.25 / days) - 1.0) * 100
+    annualized = common_annualized_return(first_value, last_value, first_date, last_date)
+    return None if annualized is None else annualized * 100
 
 
 def value_window(series: pd.Series, days_back: int, min_days: int) -> dict[str, Any]:
