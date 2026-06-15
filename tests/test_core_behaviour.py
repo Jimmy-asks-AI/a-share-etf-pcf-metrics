@@ -55,6 +55,26 @@ class CoreBehaviourTests(unittest.TestCase):
         self.assertEqual(snapshot["600000"]["price"], 10.5)
         self.assertEqual(snapshot["000001"]["price"], 11.2)
 
+    def test_clean_float_rejects_inf_and_nan(self) -> None:
+        import math
+        self.assertIsNone(self.a_metrics.clean_float(math.inf))
+        self.assertIsNone(self.a_metrics.clean_float(-math.inf))
+        self.assertIsNone(self.a_metrics.clean_float(math.nan))
+        self.assertIsNone(self.a_metrics.clean_float("inf"))
+        self.assertIsNone(self.a_metrics.clean_float("-inf"))
+        self.assertIsNone(self.a_metrics.clean_float("Infinity"))
+        self.assertAlmostEqual(self.a_metrics.clean_float("10.5%"), 10.5)
+
+    def test_is_a_stock_code_rejects_short_padded_codes(self) -> None:
+        self.assertFalse(self.a_metrics.is_a_stock_code("5"))
+        self.assertFalse(self.a_metrics.is_a_stock_code("6000"))
+        self.assertFalse(self.a_metrics.is_a_stock_code("abc"))
+        self.assertFalse(self.a_metrics.is_a_stock_code("60000a"))
+        self.assertTrue(self.a_metrics.is_a_stock_code("600000"))
+        self.assertTrue(self.a_metrics.is_a_stock_code("000005"))
+        self.assertTrue(self.a_metrics.is_a_stock_code("301000"))
+        self.assertFalse(self.a_metrics.is_a_stock_code("159919"))
+
     def test_clean_percent_accepts_percent_and_whole_number_percent(self) -> None:
         self.assertAlmostEqual(self.hk_metrics.clean_percent("10%"), 0.10)
         self.assertAlmostEqual(self.hk_metrics.clean_percent("10"), 0.10)
