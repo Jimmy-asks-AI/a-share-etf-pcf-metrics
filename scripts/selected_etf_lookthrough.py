@@ -27,6 +27,12 @@ from pcf_common import (
     earnings_yield_pe as common_earnings_yield_pe,
     weighted_average as common_weighted_average,
 )
+from pcf_enhanced_analytics import (
+    ConstraintConfig,
+    build_enhanced_outputs,
+    build_html_report,
+    build_markdown_report,
+)
 
 
 WORKSPACE = Path(__file__).resolve().parent
@@ -51,6 +57,42 @@ OUT_ETF_SUMMARY = "etf_summary.csv"
 OUT_METRICS = "metrics_summary.csv"
 OUT_JSON = "run_summary.json"
 OUT_XLSX = "lookthrough_report.xlsx"
+OUT_MARKDOWN = "enhanced_report.md"
+OUT_HTML = "enhanced_report.html"
+
+ENHANCED_CSV_OUTPUTS = {
+    "classified_detail": "classified_detail.csv",
+    "structure_analysis": "structure_analysis.csv",
+    "market_board_exposure": "market_board_exposure.csv",
+    "industry_theme_exposure": "industry_theme_exposure.csv",
+    "valuation_buckets": "valuation_buckets.csv",
+    "profit_quality": "profit_quality.csv",
+    "dividend_quality": "dividend_quality.csv",
+    "risk_analysis": "risk_analysis.csv",
+    "overlap_pairs": "overlap_pairs.csv",
+    "common_holdings": "common_holdings.csv",
+    "pcf_quality": "pcf_quality.csv",
+    "cross_validation": "cross_validation.csv",
+    "constraint_checks": "constraint_checks.csv",
+    "historical_tracking": "historical_tracking.csv",
+}
+
+ENHANCED_SHEETS = {
+    "classified_detail": "\u5206\u7c7b\u660e\u7ec6",
+    "structure_analysis": "\u7ed3\u6784\u5206\u6790",
+    "market_board_exposure": "\u5e02\u573a\u677f\u5757",
+    "industry_theme_exposure": "\u884c\u4e1a\u4e3b\u9898",
+    "valuation_buckets": "\u4f30\u503c\u5206\u5c42",
+    "profit_quality": "\u76c8\u5229\u8d28\u91cf",
+    "dividend_quality": "\u5206\u7ea2\u8d28\u91cf",
+    "risk_analysis": "\u98ce\u9669\u6307\u6807",
+    "overlap_pairs": "\u91cd\u5408\u5ea6",
+    "common_holdings": "\u5171\u540c\u6301\u4ed3",
+    "pcf_quality": "\u0050\u0043\u0046\u8d28\u91cf",
+    "cross_validation": "\u4ea4\u53c9\u9a8c\u8bc1",
+    "constraint_checks": "\u7ea6\u675f\u68c0\u67e5",
+    "historical_tracking": "\u5386\u53f2\u8ffd\u8e2a",
+}
 
 C_ETF_CODE = "\u0045\u0054\u0046\u4ee3\u7801"
 C_ETF_NAME = "\u0045\u0054\u0046\u540d\u79f0"
@@ -81,6 +123,13 @@ C_RETURN_SOURCE = "\u6536\u76ca\u6765\u6e90"
 C_RETURN_WINDOW = "\u6536\u76ca\u533a\u95f4"
 C_RISK_WINDOW = "\u98ce\u9669\u6307\u6807\u533a\u95f4"
 C_RETURN_ERROR = "\u6536\u76ca\u9519\u8bef"
+C_MAX_DRAWDOWN = "\u6700\u5927\u56de\u64a4%"
+C_SHARPE = "Sharpe Ratio"
+C_CALMAR = "Calmar Ratio"
+C_BETA = "Beta"
+C_VAR_95 = "VaR95%"
+C_CVAR_95 = "CVaR95%"
+C_DOWNSIDE_VOL = "\u4e0b\u884c\u6ce2\u52a8\u7387%"
 C_PE_COVERAGE = "\u0050\u0045\u8986\u76d6\u6743\u91cd%"
 C_DY_COVERAGE = "\u80a1\u606f\u7387\u8986\u76d6\u6743\u91cd%"
 C_PB_COVERAGE = "\u0050\u0042\u8986\u76d6\u6743\u91cd%"
@@ -403,6 +452,7 @@ def fetch_etf_price_series(ak_module: Any, etf: str, lookback_days: int) -> tupl
         series = normalize_price_series(nav, date_col, value_col)
         if len(series) >= 30:
             return series, "eastmoney_nav"
+        errors.append(f"eastmoney_nav: {len(series)} observations")
     except Exception as exc:  # noqa: BLE001
         errors.append(f"eastmoney_nav: {exc}")
 
@@ -414,6 +464,7 @@ def fetch_etf_price_series(ak_module: Any, etf: str, lookback_days: int) -> tupl
         series = normalize_price_series(price, best_column(price, ["\u65e5\u671f"], 0), best_column(price, ["\u6536\u76d8"], 2))
         if len(series) >= 30:
             return series, "eastmoney_price"
+        errors.append(f"eastmoney_price: {len(series)} observations")
     except Exception as exc:  # noqa: BLE001
         errors.append(f"eastmoney_price: {exc}")
 
@@ -422,6 +473,7 @@ def fetch_etf_price_series(ak_module: Any, etf: str, lookback_days: int) -> tupl
         series = normalize_price_series(sina, best_column(sina, ["date"], 0), best_column(sina, ["close"], 4))
         if len(series) >= 30:
             return series, "sina_price"
+        errors.append(f"sina_price: {len(series)} observations")
     except Exception as exc:  # noqa: BLE001
         errors.append(f"sina_price: {exc}")
 
@@ -475,15 +527,38 @@ def summarize_price_series(series: pd.Series, source: str) -> dict[str, Any]:
     sample = one_year_returns if len(one_year_returns) >= 60 else returns
     volatility = None
     sortino = None
+    sharpe = None
+    calmar = None
+    var_95 = None
+    cvar_95 = None
+    downside_vol = None
+    annual_return = None
     risk_window = ""
+    max_drawdown = None
+    if len(series) >= 2:
+        drawdown = series.div(series.cummax()).sub(1.0)
+        max_drawdown_fraction = float(drawdown.min())
+        max_drawdown = max_drawdown_fraction * 100
+    else:
+        max_drawdown_fraction = None
     if len(sample) >= 2:
-        volatility = float(sample.std(ddof=1)) * math.sqrt(252) * 100
+        volatility_fraction = float(sample.std(ddof=1)) * math.sqrt(252)
+        volatility = volatility_fraction * 100
         downside = sample[sample < 0]
         downside_dev = float((downside.pow(2).mean()) ** 0.5) if not downside.empty else None
         mean_daily = float(sample.mean())
         annual_return = (1 + mean_daily) ** 252 - 1 if mean_daily > -1 else None
+        if annual_return is not None and volatility_fraction > 0:
+            sharpe = annual_return / volatility_fraction
+        if annual_return is not None and max_drawdown_fraction is not None and max_drawdown_fraction < 0:
+            calmar = annual_return / abs(max_drawdown_fraction)
         if annual_return is not None and downside_dev and downside_dev > 0:
             sortino = annual_return / (downside_dev * math.sqrt(252))
+            downside_vol = downside_dev * math.sqrt(252) * 100
+        var_threshold = float(sample.quantile(0.05))
+        var_95 = var_threshold * 100
+        tail = sample[sample <= var_threshold]
+        cvar_95 = None if tail.empty else float(tail.mean()) * 100
         risk_window = f"{sample.index[0].date()} to {sample.index[-1].date()}"
 
     return {
@@ -495,6 +570,13 @@ def summarize_price_series(series: pd.Series, source: str) -> dict[str, Any]:
         C_HALF_YEAR_RETURN: trailing_return(series, days_back=183, min_days=150),
         C_ONE_YEAR_RETURN: trailing_return(series, days_back=365, min_days=330),
         C_THREE_YEAR_RETURN: trailing_return(series, days_back=365 * 3, min_days=900),
+        C_MAX_DRAWDOWN: max_drawdown,
+        C_SHARPE: sharpe,
+        C_CALMAR: calmar,
+        C_BETA: None,
+        C_VAR_95: var_95,
+        C_CVAR_95: cvar_95,
+        C_DOWNSIDE_VOL: downside_vol,
         C_RETURN_SOURCE: source,
         C_RETURN_WINDOW: ""
         if one_year.get("error")
@@ -814,6 +896,13 @@ def add_metrics_to_tables(
         C_HALF_YEAR_RETURN,
         C_ONE_YEAR_RETURN,
         C_THREE_YEAR_RETURN,
+        C_MAX_DRAWDOWN,
+        C_SHARPE,
+        C_CALMAR,
+        C_BETA,
+        C_VAR_95,
+        C_CVAR_95,
+        C_DOWNSIDE_VOL,
         C_RETURN_SOURCE,
         C_RETURN_WINDOW,
         C_RISK_WINDOW,
@@ -823,8 +912,35 @@ def add_metrics_to_tables(
         C_PB_COVERAGE,
         C_NEGATIVE_PE_WEIGHT,
     ]
-    metrics_summary = metrics_summary[[col for col in preferred_cols if col in metrics_summary.columns]]
+    for column in preferred_cols:
+        if column not in metrics_summary.columns:
+            metrics_summary[column] = None
+    metrics_summary = metrics_summary[preferred_cols]
     return summary, detail, etf_summary, metrics_summary
+
+
+def constraint_config_from_args(args: argparse.Namespace) -> ConstraintConfig:
+    return ConstraintConfig(
+        max_stock_weight=getattr(args, "max_stock_weight", None),
+        max_industry_weight=getattr(args, "max_industry_weight", None),
+        min_dividend_yield=getattr(args, "min_dividend_yield", None),
+        max_pe=getattr(args, "max_pe", None),
+        max_pb=getattr(args, "max_pb", None),
+        max_drawdown=getattr(args, "max_drawdown", None),
+        target_a_weight=getattr(args, "target_a_weight", None),
+        target_hk_weight=getattr(args, "target_hk_weight", None),
+    )
+
+
+def refresh_cache_if_requested(out_dir: Path, args: argparse.Namespace) -> None:
+    if not getattr(args, "refresh_cache", False):
+        return
+    cache_dir = out_dir / "cache"
+    if not cache_dir.exists():
+        return
+    for path in cache_dir.glob("holdings_*.csv"):
+        if path.is_file():
+            path.unlink()
 
 
 def write_outputs(
@@ -836,10 +952,34 @@ def write_outputs(
     args: argparse.Namespace,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    refresh_cache_if_requested(out_dir, args)
     summary.to_csv(out_dir / OUT_SUMMARY, index=False, encoding="utf-8-sig")
     detail.to_csv(out_dir / OUT_DETAIL, index=False, encoding="utf-8-sig")
     etf_summary.to_csv(out_dir / OUT_ETF_SUMMARY, index=False, encoding="utf-8-sig")
     metrics_summary.to_csv(out_dir / OUT_METRICS, index=False, encoding="utf-8-sig")
+    enhanced_outputs = build_enhanced_outputs(
+        summary,
+        detail,
+        etf_summary,
+        metrics_summary,
+        args=vars(args),
+        out_dir=out_dir,
+        constraints=constraint_config_from_args(args),
+        use_cache=getattr(args, "use_cache", True),
+    )
+    for key, filename in ENHANCED_CSV_OUTPUTS.items():
+        df = enhanced_outputs.get(key)
+        if df is not None:
+            df.to_csv(out_dir / filename, index=False, encoding="utf-8-sig")
+    report_outputs = {
+        "summary": summary,
+        "detail": detail,
+        "etf_summary": etf_summary,
+        "metrics_summary": metrics_summary,
+        **enhanced_outputs,
+    }
+    (out_dir / OUT_MARKDOWN).write_text(build_markdown_report(report_outputs), encoding="utf-8")
+    (out_dir / OUT_HTML).write_text(build_html_report(report_outputs), encoding="utf-8")
     run_summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "etfs": args.etf,
@@ -850,7 +990,9 @@ def write_outputs(
             "detail": len(detail),
             "etf_summary": len(etf_summary),
             "metrics_summary": len(metrics_summary),
+            **{key: len(df) for key, df in enhanced_outputs.items()},
         },
+        "reports": [OUT_XLSX, OUT_MARKDOWN, OUT_HTML, "run_manifest.json"],
         "max_single_stock_exposure_pct": None if summary.empty else float(summary["\u7ec4\u5408\u7a7f\u900f\u6743\u91cd%"].max()),
         "pcf_periods": sorted(str(x) for x in detail[C_PERIOD].dropna().unique()) if not detail.empty else [],
     }
@@ -861,13 +1003,18 @@ def write_outputs(
         detail.to_excel(writer, index=False, sheet_name="\u7a7f\u900f\u660e\u7ec6")
         etf_summary.to_excel(writer, index=False, sheet_name="\u0045\u0054\u0046\u6c47\u603b")
         metrics_summary.to_excel(writer, index=False, sheet_name="\u6307\u6807\u6c47\u603b")
+        for key, sheet_name in ENHANCED_SHEETS.items():
+            df = enhanced_outputs.get(key)
+            if df is not None:
+                df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
         for sheet_name, width_map in {
             "\u7a7f\u900f\u6c47\u603b": {1: 8, 2: 12, 3: 14, 4: 24, 5: 16, 6: 12},
             "\u7a7f\u900f\u660e\u7ec6": {1: 12, 2: 24, 3: 12, 4: 12, 5: 12, 6: 14, 7: 24},
             "\u0045\u0054\u0046\u6c47\u603b": {1: 12, 2: 24, 3: 12, 4: 12, 5: 16, 6: 16},
             "\u6307\u6807\u6c47\u603b": {1: 10, 2: 12, 3: 24, 4: 12, 5: 14, 6: 16, 7: 16},
+            **{sheet_name: {} for sheet_name in ENHANCED_SHEETS.values()},
         }.items():
-            ws = writer.book[sheet_name]
+            ws = writer.book[sheet_name[:31]]
             ws.freeze_panes = "A2"
             for col_idx in range(1, ws.max_column + 1):
                 ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = width_map.get(col_idx, 14)
@@ -899,6 +1046,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hk-alt-limit", type=int, default=0, help="HK alternate valuation cross-check count; 0 keeps primary source only.")
     parser.add_argument("--hk-sleep", type=float, default=0.05, help="Sleep seconds between HK constituent metric requests.")
     parser.add_argument("--nav-lookback-days", type=int, default=365 * 3 + 120, help="ETF NAV/price lookback window for return metrics.")
+    parser.add_argument("--compare", action="store_true", help="Generate cross-source validation outputs. Included by default.")
+    parser.add_argument("--portfolio", action="store_true", help="Compatibility flag; portfolio mode is automatic when multiple ETFs or weights are supplied.")
+    parser.add_argument("--industry", action="store_true", help="Generate industry exposure outputs. Included by default.")
+    parser.add_argument("--theme", action="store_true", help="Generate theme exposure outputs. Included by default.")
+    parser.add_argument("--risk", action="store_true", help="Generate risk analysis outputs. Included by default.")
+    parser.add_argument("--html-report", action="store_true", help="Write enhanced_report.html. Included by default.")
+    cache_group = parser.add_mutually_exclusive_group()
+    cache_group.add_argument("--cache", dest="use_cache", action="store_true", default=True, help="Cache the current look-through holdings snapshot. Default.")
+    cache_group.add_argument("--no-cache", dest="use_cache", action="store_false", help="Do not write a holdings snapshot under output cache.")
+    parser.add_argument("--refresh-cache", action="store_true", help="Remove existing holdings snapshots in the output cache before this run.")
+    parser.add_argument("--max-stock-weight", type=float, help="Constraint check: max allowed single-stock look-through weight percent.")
+    parser.add_argument("--max-industry-weight", type=float, help="Constraint check: max allowed rule-industry look-through weight percent.")
+    parser.add_argument("--min-dividend-yield", type=float, help="Constraint check: minimum portfolio dividend yield percent.")
+    parser.add_argument("--max-pe", type=float, help="Constraint check: maximum portfolio PE.")
+    parser.add_argument("--max-pb", type=float, help="Constraint check: maximum portfolio PB.")
+    parser.add_argument("--max-drawdown", type=float, help="Constraint check: maximum drawdown lower bound, e.g. -20 means no worse than -20%%.")
+    parser.add_argument("--target-a-weight", type=float, help="Constraint check: minimum A-share look-through weight percent.")
+    parser.add_argument("--target-hk-weight", type=float, help="Constraint check: minimum Hong Kong look-through weight percent.")
     return parser
 
 
@@ -937,6 +1102,9 @@ def main() -> int:
     print(f"Saved: {out_dir / OUT_ETF_SUMMARY}")
     print(f"Saved: {out_dir / OUT_METRICS}")
     print(f"Saved: {out_dir / OUT_XLSX}")
+    print(f"Saved: {out_dir / OUT_MARKDOWN}")
+    print(f"Saved: {out_dir / OUT_HTML}")
+    print(f"Saved: {out_dir / 'run_manifest.json'}")
     if not summary.empty:
         print("\nTop look-through holdings:")
         print(summary.head(15).to_string(index=False))

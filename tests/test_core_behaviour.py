@@ -37,6 +37,7 @@ class CoreBehaviourTests(unittest.TestCase):
         cls.a_metrics = import_script("test_a_metrics", "scripts/run_a_share_dividend_etf_pcf_metrics.py")
         cls.hk_metrics = import_script("test_hk_metrics", "scripts/pcf_lookthrough.py")
         cls.selected = import_script("test_selected", "scripts/selected_etf_lookthrough.py")
+        cls.enhanced = import_script("test_enhanced", "scripts/pcf_enhanced_analytics.py")
         cls.runner = import_script("test_runner", "scripts/run_pcf_metrics.py")
 
     def test_load_a_stock_snapshot_does_not_recurse(self) -> None:
@@ -106,6 +107,46 @@ class CoreBehaviourTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["PB"], 1.7)
         self.assertAlmostEqual(metrics["股息率%"], 6.4)
         self.assertAlmostEqual(metrics["PE覆盖权重%"], 100.0)
+
+    def test_enhanced_structure_groups_duplicate_stock_before_concentration(self) -> None:
+        cols = {
+            "etf": "\u0045\u0054\u0046\u4ee3\u7801",
+            "code": "\u80a1\u7968\u4ee3\u7801",
+            "name": "\u80a1\u7968\u540d\u79f0",
+            "market": "\u5e95\u5c42\u5e02\u573a",
+            "inner_weight": "\u0045\u0054\u0046\u5185\u6743\u91cd%",
+            "portfolio_weight": "\u7ec4\u5408\u7a7f\u900f\u6743\u91cd%",
+        }
+        detail = pd.DataFrame(
+            [
+                {cols["etf"]: "159001", cols["code"]: "000001", cols["name"]: "Ping An Bank", cols["market"]: "A", cols["inner_weight"]: 6.0, cols["portfolio_weight"]: 3.6},
+                {cols["etf"]: "159002", cols["code"]: "000001", cols["name"]: "Ping An Bank", cols["market"]: "A", cols["inner_weight"]: 1.0, cols["portfolio_weight"]: 0.4},
+                {cols["etf"]: "159002", cols["code"]: "000002", cols["name"]: "Vanke A", cols["market"]: "A", cols["inner_weight"]: 7.5, cols["portfolio_weight"]: 3.0},
+            ]
+        )
+
+        structure, _ = self.enhanced.build_structure_analysis(detail)
+        max_stock = structure.loc[structure["\u6307\u6807"].eq("\u5355\u4e00\u80a1\u7968\u6700\u5927\u6743\u91cd"), "\u6570\u503c"].iloc[0]
+        stock_count = structure.loc[structure["\u6307\u6807"].eq("\u5e95\u5c42\u6301\u4ed3\u6570\u91cf"), "\u6570\u503c"].iloc[0]
+
+        self.assertAlmostEqual(max_stock, 4.0)
+        self.assertEqual(stock_count, 2)
+
+    def test_latest_dividend_yield_handles_datetime64_ex_date(self) -> None:
+        self.a_metrics.ak.stock_history_dividend_detail = lambda symbol, indicator: pd.DataFrame(
+            [
+                {
+                    "\u6d3e\u606f": 2.0,
+                    "\u8fdb\u5ea6": "\u5b9e\u65bd",
+                    "\u9664\u6743\u9664\u606f\u65e5": pd.Timestamp("2026-01-15"),
+                }
+            ]
+        )
+
+        yield_pct, source = self.a_metrics.latest_dividend_yield("688981", 20.0, pd.Timestamp("2026-06-15").date())
+
+        self.assertAlmostEqual(yield_pct, 1.0)
+        self.assertIn("trailing_12m_ex_date", source)
 
     def test_run_pcf_metrics_default_missing_input_has_actionable_error(self) -> None:
         args = Namespace(etf=None, input=self.runner.DEFAULT_INPUT, code_column="ETF代码")

@@ -500,13 +500,14 @@ def latest_dividend_yield(code: str, price: float | None, today: date) -> tuple[
         status_col = "进度" if "进度" in df.columns else str(df.columns[4])
         ex_col = "除权除息日" if "除权除息日" in df.columns else str(df.columns[5])
         temp = df.copy()
-        temp["_ex_date"] = pd.to_datetime(temp[ex_col], errors="coerce").dt.date
+        temp["_ex_date"] = pd.to_datetime(temp[ex_col], errors="coerce").dt.normalize()
         temp["_cash_per_10"] = pd.to_numeric(temp[amount_col], errors="coerce")
         temp["_status"] = temp[status_col].astype(str)
-        cutoff = today - timedelta(days=365)
+        today_ts = pd.Timestamp(today)
+        cutoff = today_ts - pd.Timedelta(days=365)
         implemented = temp[
             (temp["_ex_date"].notna())
-            & (temp["_ex_date"] <= today)
+            & (temp["_ex_date"] <= today_ts)
             & (temp["_ex_date"] >= cutoff)
             & temp["_status"].str.contains("实施", na=False)
             & (temp["_cash_per_10"] > 0)
@@ -514,7 +515,7 @@ def latest_dividend_yield(code: str, price: float | None, today: date) -> tuple[
         if implemented.empty:
             return 0.0, "no implemented cash dividend in trailing 12 months"
         cash_per_share = float(implemented["_cash_per_10"].sum()) / 10.0
-        return cash_per_share / price * 100, f"trailing_12m_ex_date:{cutoff.isoformat()} to {today.isoformat()}"
+        return cash_per_share / price * 100, f"trailing_12m_ex_date:{cutoff.date().isoformat()} to {today.isoformat()}"
     except Exception as exc:
         return None, str(exc)[:160]
 
