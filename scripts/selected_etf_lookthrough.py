@@ -39,6 +39,7 @@ WORKSPACE = Path(__file__).resolve().parent
 DEFAULT_A_SCRIPT = WORKSPACE / "run_a_share_dividend_etf_pcf_metrics.py"
 DEFAULT_HK_SCRIPT = WORKSPACE / "pcf_lookthrough.py"
 DEFAULT_US_SCRIPT = WORKSPACE / "us_etf_lookthrough.py"
+DEFAULT_US_LISTED_SCRIPT = WORKSPACE / "us_listed_etf_lookthrough.py"
 
 C_STOCK_CODE = "\u80a1\u7968\u4ee3\u7801"
 C_STOCK_NAME = "\u80a1\u7968\u540d\u79f0"
@@ -168,7 +169,12 @@ def retry(callable_obj: Callable[[], Any], tries: int = 3, sleep: float = 1.2) -
 
 
 def normalize_etf_code(value: Any) -> str:
-    code = re.sub(r"\D", "", str(value))
+    text = str(value).strip().upper()
+    if text.endswith(".US"):
+        ticker = re.sub(r"[^A-Z0-9.\-]", "", text[:-3])
+        if ticker:
+            return f"{ticker}.US"
+    code = re.sub(r"\D", "", text)
     if not code:
         raise ValueError(f"Invalid ETF code: {value!r}")
     return code.zfill(6)
@@ -206,7 +212,7 @@ def parse_modes(raw: str | None, count: int) -> list[str]:
         values = values * count
     if len(values) != count:
         raise ValueError(f"--markets count ({len(values)}) must match ETF count ({count}).")
-    allowed = {"auto", "a", "hk", "us"}
+    allowed = {"auto", "a", "hk", "us", "us_listed"}
     invalid = sorted(set(values) - allowed)
     if invalid:
         raise ValueError(f"Invalid --markets value(s): {', '.join(invalid)}")
@@ -217,6 +223,7 @@ def selected_etfs(codes_raw: str, weights_raw: str | None, markets_raw: str | No
     codes = parse_codes(codes_raw)
     weights = parse_weights(weights_raw, len(codes))
     modes = parse_modes(markets_raw, len(codes))
+    modes = ["us_listed" if code.endswith(".US") and mode == "auto" else mode for code, mode in zip(codes, modes)]
     return [SelectedETF(code=code, weight=weight, mode=mode) for code, weight, mode in zip(codes, weights, modes)]
 
 
@@ -346,12 +353,42 @@ def get_us_stock_holdings(us_module: Any, etf: str) -> tuple[pd.DataFrame, dict[
     return result, meta
 
 
+def get_us_listed_stock_holdings(us_listed_module: Any, etf: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    ticker = us_listed_module.normalize_us_ticker(etf)
+    _summary, etf_summary, detail, _sources, failed = us_listed_module.build_tables([ticker], [1.0], "auto", cache_dir=None)
+    if detail.empty:
+        raise RuntimeError(f"No US-listed ETF holdings for {etf}: {failed}")
+    result = pd.DataFrame(
+        {
+            C_STOCK_CODE: detail[us_listed_module.C_STOCK_CODE].astype(str).map(us_listed_module.normalize_us_ticker),
+            C_STOCK_NAME: detail[us_listed_module.C_STOCK_NAME],
+            C_MARKET: detail[us_listed_module.C_MARKET],
+            C_ETF_INNER_WEIGHT: pd.to_numeric(detail[us_listed_module.C_INNER_WEIGHT], errors="coerce"),
+            C_STOCK_PRICE: pd.to_numeric(detail.get(us_listed_module.C_PRICE), errors="coerce"),
+            C_WEIGHT_SOURCE: detail.get(us_listed_module.C_WEIGHT_SOURCE, ""),
+            C_DETAIL_SOURCE: detail.get(us_listed_module.C_SOURCE_DETAIL, ""),
+            C_VALUATION_ERROR: detail.get(us_listed_module.C_VAL_ERROR, ""),
+        }
+    ).dropna(subset=[C_ETF_INNER_WEIGHT])
+    row = etf_summary.iloc[0] if not etf_summary.empty else {}
+    meta = {
+        C_PERIOD: row.get(us_listed_module.C_PERIOD, ""),
+        C_SOURCE: row.get(us_listed_module.C_SOURCE, "us_listed"),
+        C_MODE: "us_listed",
+        C_STOCK_COUNT: int(len(result)),
+        "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%": float(result[C_ETF_INNER_WEIGHT].sum()),
+        C_ETF_NAME: row.get(us_listed_module.C_ETF_NAME, ticker),
+    }
+    return result, meta
+
+
 def resolve_holdings(
     selected: SelectedETF,
     a_module: Any,
     hk_module: Any,
     us_module: Any,
     min_auto_weight: float,
+    us_listed_module: Any | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if selected.mode == "hk":
         return get_hk_stock_holdings(hk_module, selected.code)
@@ -359,6 +396,10 @@ def resolve_holdings(
         return get_a_stock_holdings(a_module, selected.code)
     if selected.mode == "us":
         return get_us_stock_holdings(us_module, selected.code)
+    if selected.mode == "us_listed":
+        if us_listed_module is None:
+            raise RuntimeError("us_listed mode requires --us-listed-script")
+        return get_us_listed_stock_holdings(us_listed_module, selected.code)
 
     candidates: list[tuple[pd.DataFrame, dict[str, Any]]] = []
     errors: dict[str, str] = {}
@@ -781,6 +822,7 @@ def build_tables(
     a_module: Any,
     hk_module: Any,
     us_module: Any,
+    us_listed_module: Any | None,
     name_map: dict[str, str],
     min_auto_weight: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -788,8 +830,8 @@ def build_tables(
     etf_rows: list[dict[str, Any]] = []
     for selected in selections:
         print(f"Reading latest PCF for ETF {selected.code} mode={selected.mode}...")
-        holdings, meta = resolve_holdings(selected, a_module, hk_module, us_module, min_auto_weight)
-        etf_name = name_map.get(selected.code, "")
+        holdings, meta = resolve_holdings(selected, a_module, hk_module, us_module, min_auto_weight, us_listed_module)
+        etf_name = name_map.get(selected.code, "") or str(meta.get(C_ETF_NAME) or "")
         for _, row in holdings.iterrows():
             etf_weight_pct = selected.weight * 100
             holding_weight = float(row[C_ETF_INNER_WEIGHT])
@@ -830,9 +872,10 @@ def build_tables(
     detail = pd.DataFrame(detail_rows)
     etf_summary = pd.DataFrame(etf_rows)
     summary = (
-        detail.groupby([C_UNDERLYING_MARKET, C_STOCK_CODE, C_STOCK_NAME], as_index=False)
+        detail.groupby([C_UNDERLYING_MARKET, C_STOCK_CODE], as_index=False)
         .agg(
             **{
+                C_STOCK_NAME: (C_STOCK_NAME, first_valid),
                 C_PORTFOLIO_WEIGHT: (C_PORTFOLIO_WEIGHT, "sum"),
                 "\u8986\u76d6\u0045\u0054\u0046\u6570": (C_ETF_CODE, "nunique"),
             }
@@ -855,10 +898,15 @@ def safe_return_metrics(ak_module: Any, etf: str, lookback_days: int) -> dict[st
 def rebuild_summary_from_detail(detail: pd.DataFrame) -> pd.DataFrame:
     if detail.empty:
         return pd.DataFrame()
+    detail = detail.copy()
+    for column in [C_STOCK_NAME, C_STOCK_PRICE, C_STOCK_PE, C_STOCK_PB, C_STOCK_DY, C_VALUATION_SOURCE, C_DIVIDEND_SOURCE, C_VALUATION_ERROR]:
+        if column not in detail.columns:
+            detail[column] = None
     summary = (
-        detail.groupby([C_UNDERLYING_MARKET, C_STOCK_CODE, C_STOCK_NAME], as_index=False)
+        detail.groupby([C_UNDERLYING_MARKET, C_STOCK_CODE], as_index=False)
         .agg(
             **{
+                C_STOCK_NAME: (C_STOCK_NAME, first_valid),
                 C_PORTFOLIO_WEIGHT: (C_PORTFOLIO_WEIGHT, "sum"),
                 "\u8986\u76d6\u0045\u0054\u0046\u6570": (C_ETF_CODE, "nunique"),
                 C_STOCK_PRICE: (C_STOCK_PRICE, first_valid),
@@ -1101,12 +1149,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weights", help="Optional weights. Percent or decimal. Defaults to equal weights.")
     parser.add_argument(
         "--markets",
-        help="Optional per-ETF modes: auto, hk, a, us. One value applies to all; or provide one per ETF. Default: auto.",
+        help="Optional per-ETF modes: auto, hk, a, us, us_listed. One value applies to all; or provide one per ETF. Default: auto.",
     )
     parser.add_argument("--out-dir", default="selected_etf_lookthrough_output", help="Output directory.")
     parser.add_argument("--a-script", default=str(DEFAULT_A_SCRIPT), help="Path to A-share PCF helper script.")
     parser.add_argument("--hk-script", default=str(DEFAULT_HK_SCRIPT), help="Path to HK PCF helper script.")
     parser.add_argument("--us-script", default=str(DEFAULT_US_SCRIPT), help="Path to US-stock PCF helper script.")
+    parser.add_argument("--us-listed-script", default=str(DEFAULT_US_LISTED_SCRIPT), help="Path to US-listed ETF helper script.")
     parser.add_argument(
         "--min-auto-weight",
         type=float,
@@ -1147,12 +1196,14 @@ def main() -> int:
     a_module = import_module(Path(args.a_script), "selected_etf_a_pcf")
     hk_module = import_module(Path(args.hk_script), "selected_etf_hk_pcf")
     us_module = import_module(Path(args.us_script), "selected_etf_us_pcf")
+    us_listed_module = import_module(Path(args.us_listed_script), "selected_etf_us_listed_pcf")
     name_map = maybe_load_name_map()
     summary, detail, etf_summary = build_tables(
         selections,
         a_module=a_module,
         hk_module=hk_module,
         us_module=us_module,
+        us_listed_module=us_listed_module,
         name_map=name_map,
         min_auto_weight=args.min_auto_weight,
     )

@@ -111,7 +111,7 @@ Selected workflow outputs:
 - `lookthrough_report.xlsx`: workbook containing the base sheets and enhanced sheets.
 - `enhanced_report.md`, `enhanced_report.html`, `run_summary.json`, `run_manifest.json`.
 
-`--weights` accepts percentages or decimals and is normalized internally. If omitted, ETFs are equal weighted. `--markets` can force `auto`, `hk`, `a`, or `us`; use `auto` unless the parser chooses the wrong market.
+`--weights` accepts percentages or decimals and is normalized internally. If omitted, ETFs are equal weighted. `--markets` can force `auto`, `hk`, `a`, `us`, or `us_listed`; use `auto` unless the parser chooses the wrong market. Tickers ending in `.US` auto-select `us_listed`.
 
 Run a US ETF:
 
@@ -123,6 +123,7 @@ Run a mixed A/H/US portfolio:
 
 ```powershell
 python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,513100 --markets a,hk,us --weights 40,30,30 --out-dir selected-global-etf-output
+python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,513100,QQQ.US --markets a,hk,us,us_listed --weights 25,25,25,25 --out-dir selected-global-us-listed-output
 ```
 
 Useful selected-workflow options:

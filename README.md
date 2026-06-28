@@ -84,6 +84,7 @@ Run a mixed A/H/US portfolio:
 
 ```powershell
 python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,513100 --markets a,hk,us --weights 40,30,30 --out-dir selected-global-etf-output
+python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,513100,QQQ.US --markets a,hk,us,us_listed --weights 25,25,25,25 --out-dir selected-global-us-listed-output
 ```
 
 Selected workflow outputs:
@@ -98,7 +99,7 @@ Selected workflow outputs:
 
 Useful options:
 
-- `--markets auto,a,hk,us`: choose one mode for all ETFs or one mode per ETF.
+- `--markets auto,a,hk,us,us_listed`: choose one mode for all ETFs or one mode per ETF.
 - `--us-script`: override the US-stock PCF helper path.
 - `--target-a-weight`, `--target-hk-weight`, `--target-us-weight`: minimum look-through market exposure checks.
 - `--max-stock-weight`, `--max-industry-weight`, `--min-dividend-yield`, `--max-pe`, `--max-pb`, `--max-drawdown`: portfolio constraint checks.
@@ -147,9 +148,25 @@ Optional network smoke tests:
 ```powershell
 python scripts\run_pcf_metrics.py --etf 513690,159569 --out-dir pcf-metrics-smoke-test
 python scripts\selected_etf_lookthrough.py --etf 513100 --markets us --skip-metrics --out-dir selected-us-smoke-test
-python scripts\selected_etf_lookthrough.py --etf 510880,159569,513100 --markets a,hk,us --weights 40,30,30 --skip-metrics --out-dir selected-global-smoke-test
+python scripts\selected_etf_lookthrough.py --etf 510880,159569,513100,QQQ.US --markets a,hk,us,us_listed --weights 25,25,25,25 --skip-metrics --out-dir selected-global-plus-us-listed-smoke-test
 python scripts\run_pcf_metrics.py --market us --etf 513100 --out-dir batch-us-smoke-test --keep-intermediates
 python scripts\us_listed_etf_lookthrough.py --ticker QQQ.US,DRAM.US --out-dir us-listed-smoke-test
+```
+
+Latest cross-market smoke result, run on 2026-06-28:
+
+```text
+Command:
+python scripts\selected_etf_lookthrough.py --etf 510880,159569,513100,QQQ.US --markets a,hk,us,us_listed --weights 25,25,25,25 --skip-metrics --no-cache --out-dir selected-global-plus-us-listed-smoke-test
+
+Result:
+- Completed successfully and wrote lookthrough_summary.csv, lookthrough_detail.csv, etf_summary.csv, lookthrough_report.xlsx, and enhanced audit CSV/HTML/MD files.
+- ETF holding rows: 510880 A-share mode 50 stocks, 159569 HK mode 30 stocks, 513100 A-listed US-stock mode 101 stocks, QQQ.US US-listed mode 102 stocks.
+- QQQ.US source: SEC NPORT, holdings date 2026-03-31.
+- Look-through market exposure: A 24.3746%, HK 25.0000%, US 48.8264%, other overseas markets 1.1927%, cash/other 0.6064%.
+- Top combined holdings after same-ticker merge: NVDA 4.1328% across 2 ETFs, AAPL 3.6674% across 2 ETFs, MSFT 2.5046% across 2 ETFs, AMZN 2.1695% across 2 ETFs, MU 1.8863% across 2 ETFs.
+
+This smoke uses --skip-metrics, so it validates cross-market PCF parsing, portfolio weighting, market exposure, and report generation; PE/PB/dividend/risk endpoint coverage should be tested with a non-skip run.
 ```
 
 ## Notes

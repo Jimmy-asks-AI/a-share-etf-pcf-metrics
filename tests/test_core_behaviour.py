@@ -190,7 +190,76 @@ class CoreBehaviourTests(unittest.TestCase):
 
     def test_selected_parse_modes_accepts_us(self) -> None:
         self.assertEqual(self.selected.parse_modes("us", 2), ["us", "us"])
-        self.assertEqual(self.selected.parse_modes("auto,a,hk,us", 4), ["auto", "a", "hk", "us"])
+        self.assertEqual(self.selected.parse_modes("auto,a,hk,us,us_listed", 5), ["auto", "a", "hk", "us", "us_listed"])
+        self.assertEqual(self.selected.selected_etfs("510880,QQQ.US", "60,40", None)[1].mode, "us_listed")
+
+    def test_selected_can_adapt_us_listed_holdings(self) -> None:
+        fake = types.SimpleNamespace(
+            C_ETF_CODE=self.selected.C_ETF_CODE,
+            C_ETF_NAME=self.selected.C_ETF_NAME,
+            C_ETF_WEIGHT=self.selected.C_ETF_WEIGHT,
+            C_MODE=self.selected.C_MODE,
+            C_MARKET=self.selected.C_UNDERLYING_MARKET,
+            C_STOCK_CODE=self.selected.C_STOCK_CODE,
+            C_STOCK_NAME=self.selected.C_STOCK_NAME,
+            C_INNER_WEIGHT=self.selected.C_ETF_INNER_WEIGHT,
+            C_PRICE=self.selected.C_STOCK_PRICE,
+            C_WEIGHT_SOURCE=self.selected.C_WEIGHT_SOURCE,
+            C_SOURCE_DETAIL=self.selected.C_DETAIL_SOURCE,
+            C_VAL_ERROR=self.selected.C_VALUATION_ERROR,
+            C_PERIOD=self.selected.C_PERIOD,
+            C_SOURCE=self.selected.C_SOURCE,
+            normalize_us_ticker=lambda value: str(value).upper().replace(".US", ""),
+        )
+        detail = pd.DataFrame(
+            [
+                {
+                    fake.C_STOCK_CODE: "AAPL",
+                    fake.C_STOCK_NAME: "Apple",
+                    fake.C_MARKET: "US",
+                    fake.C_INNER_WEIGHT: 10.0,
+                    fake.C_PRICE: 200.0,
+                    fake.C_WEIGHT_SOURCE: "fixture",
+                    fake.C_SOURCE_DETAIL: "fixture.csv",
+                    fake.C_VAL_ERROR: "",
+                }
+            ]
+        )
+        etf_summary = pd.DataFrame([{fake.C_ETF_NAME: "Invesco QQQ", fake.C_PERIOD: "NPORT", fake.C_SOURCE: "sec_nport"}])
+        fake.build_tables = lambda tickers, weights, source, cache_dir=None: (pd.DataFrame(), etf_summary, detail, [], [])
+
+        holdings, meta = self.selected.get_us_listed_stock_holdings(fake, "QQQ.US")
+
+        self.assertEqual(holdings.iloc[0][self.selected.C_STOCK_CODE], "AAPL")
+        self.assertEqual(meta[self.selected.C_MODE], "us_listed")
+        self.assertEqual(meta[self.selected.C_ETF_NAME], "Invesco QQQ")
+        self.assertAlmostEqual(meta["\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%"], 10.0)
+
+    def test_selected_summary_groups_same_market_code_with_different_names(self) -> None:
+        detail = pd.DataFrame(
+            [
+                {
+                    self.selected.C_UNDERLYING_MARKET: "US",
+                    self.selected.C_STOCK_CODE: "NVDA",
+                    self.selected.C_STOCK_NAME: "NVDA",
+                    self.selected.C_PORTFOLIO_WEIGHT: 1.0,
+                    self.selected.C_ETF_CODE: "513100",
+                },
+                {
+                    self.selected.C_UNDERLYING_MARKET: "US",
+                    self.selected.C_STOCK_CODE: "NVDA",
+                    self.selected.C_STOCK_NAME: "NVIDIA Corp.",
+                    self.selected.C_PORTFOLIO_WEIGHT: 2.0,
+                    self.selected.C_ETF_CODE: "QQQ.US",
+                },
+            ]
+        )
+
+        summary = self.selected.rebuild_summary_from_detail(detail)
+
+        self.assertEqual(len(summary), 1)
+        self.assertAlmostEqual(summary.iloc[0][self.selected.C_PORTFOLIO_WEIGHT], 3.0)
+        self.assertEqual(summary.iloc[0]["\u8986\u76d6\u0045\u0054\u0046\u6570"], 2)
 
     def test_sse_us_pcf_uses_cash_amount_over_nav(self) -> None:
         def fake_query(etf, sql):
