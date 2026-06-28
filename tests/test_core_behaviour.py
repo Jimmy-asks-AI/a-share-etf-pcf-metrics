@@ -36,6 +36,7 @@ class CoreBehaviourTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.a_metrics = import_script("test_a_metrics", "scripts/run_a_share_dividend_etf_pcf_metrics.py")
         cls.hk_metrics = import_script("test_hk_metrics", "scripts/pcf_lookthrough.py")
+        cls.us_metrics = import_script("test_us_metrics", "scripts/us_etf_lookthrough.py")
         cls.selected = import_script("test_selected", "scripts/selected_etf_lookthrough.py")
         cls.enhanced = import_script("test_enhanced", "scripts/pcf_enhanced_analytics.py")
         cls.runner = import_script("test_runner", "scripts/run_pcf_metrics.py")
@@ -180,6 +181,156 @@ class CoreBehaviourTests(unittest.TestCase):
             self.assertTrue(keep_csv.exists())
             self.assertTrue(keep_xlsx.exists())
             self.assertFalse(remove_json.exists())
+
+    def test_us_ticker_normalization_preserves_ticker_shape(self) -> None:
+        self.assertEqual(self.us_metrics.normalize_us_ticker(" brk.b "), "BRK.B")
+        self.assertEqual(self.us_metrics.normalize_us_ticker("BRK-B"), "BRK-B")
+        self.assertEqual(self.us_metrics.normalize_us_ticker("googl"), "GOOGL")
+        self.assertFalse(self.us_metrics.is_us_ticker("600000"))
+
+    def test_selected_parse_modes_accepts_us(self) -> None:
+        self.assertEqual(self.selected.parse_modes("us", 2), ["us", "us"])
+        self.assertEqual(self.selected.parse_modes("auto,a,hk,us", 4), ["auto", "a", "hk", "us"])
+
+    def test_sse_us_pcf_uses_cash_amount_over_nav(self) -> None:
+        def fake_query(etf, sql):
+            if sql == self.us_metrics.SSE_ETF_BASIC_SQL:
+                return {"result": [{"NAVPERCU": "1000", "TRADING_DAY": "20260626"}]}
+            return {
+                "result": [
+                    {
+                        "INSTRUMENT_ID": "AAPL",
+                        "INSTRUMENT_NAME": "Apple",
+                        "UNDERLYION_SECURITY_ID": "9999",
+                        "SUBSTITUTION_CASH_AMOUNT": "50",
+                        "QUANTITY": "2",
+                        "SUBSTITUTION_FLAG": "1",
+                    }
+                ]
+            }
+
+        old_query = self.us_metrics.query_sse_pcf
+        try:
+            self.us_metrics.query_sse_pcf = fake_query
+            df, period = self.us_metrics.get_sse_pcf_holdings("513100")
+        finally:
+            self.us_metrics.query_sse_pcf = old_query
+
+        self.assertEqual(period, "PCF:20260626")
+        self.assertEqual(df.iloc[0]["\u80a1\u7968\u4ee3\u7801"], "AAPL")
+        self.assertEqual(df.iloc[0]["\u5e02\u573a"], "US")
+        self.assertAlmostEqual(df.iloc[0]["\u6743\u91cd%"], 5.0)
+        self.assertEqual(df.iloc[0]["\u6743\u91cd\u6765\u6e90"], "SUBSTITUTION_CASH_AMOUNT/NAVPERCU")
+
+    def test_szse_us_pcf_can_estimate_quantity_price_fx_weight(self) -> None:
+        xml = """<Root>
+        <NAVperCU>1000</NAVperCU><TradingDay>20260626</TradingDay>
+        <Component>
+          <UnderlyingSecurityIDSource>9999</UnderlyingSecurityIDSource>
+          <UnderlyingSecurityID>MSFT</UnderlyingSecurityID>
+          <UnderlyingSymbol>Microsoft</UnderlyingSymbol>
+          <ComponentShare>2</ComponentShare>
+          <CreationCashSubstitute>0</CreationCashSubstitute>
+          <PremiumRatio>0</PremiumRatio>
+          <SubstituteFlag>1</SubstituteFlag>
+        </Component>
+        </Root>"""
+        old_fetch = self.us_metrics.fetch_szse_pcf_xml
+        old_fx = self.us_metrics.get_usd_cny_rate
+        old_price = self.us_metrics.get_us_latest_price
+        try:
+            self.us_metrics.fetch_szse_pcf_xml = lambda etf: (xml, "fixture.xml")
+            self.us_metrics.get_usd_cny_rate = lambda: 7.0
+            self.us_metrics.get_us_latest_price = lambda ticker: 10.0
+            df, _ = self.us_metrics.get_szse_pcf_holdings("159941")
+        finally:
+            self.us_metrics.fetch_szse_pcf_xml = old_fetch
+            self.us_metrics.get_usd_cny_rate = old_fx
+            self.us_metrics.get_us_latest_price = old_price
+
+        self.assertEqual(df.iloc[0]["\u80a1\u7968\u4ee3\u7801"], "MSFT")
+        self.assertAlmostEqual(df.iloc[0]["\u6743\u91cd%"], 14.0)
+        self.assertEqual(df.iloc[0]["\u6743\u91cd\u6765\u6e90"], "ComponentShare*US latest price*USD/CNY/NAVperCU")
+
+    def test_auto_mode_can_choose_us_best_weight(self) -> None:
+        key = "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%"
+
+        def fake_result(mode, weight):
+            return pd.DataFrame({"x": [1]}), {key: weight, self.selected.C_MODE: mode}
+
+        old_hk = self.selected.get_hk_stock_holdings
+        old_a = self.selected.get_a_stock_holdings
+        old_us = self.selected.get_us_stock_holdings
+        try:
+            self.selected.get_hk_stock_holdings = lambda module, etf: fake_result("hk", 20)
+            self.selected.get_a_stock_holdings = lambda module, etf: fake_result("a", 50)
+            self.selected.get_us_stock_holdings = lambda module, etf: fake_result("us", 90)
+            _, meta = self.selected.resolve_holdings(self.selected.SelectedETF("513100", 1.0, "auto"), object(), object(), object(), 30)
+        finally:
+            self.selected.get_hk_stock_holdings = old_hk
+            self.selected.get_a_stock_holdings = old_a
+            self.selected.get_us_stock_holdings = old_us
+
+        self.assertEqual(meta[self.selected.C_MODE], "us")
+
+    def test_constraint_checks_include_target_us_weight(self) -> None:
+        detail = pd.DataFrame(
+            [
+                {
+                    "\u80a1\u7968\u4ee3\u7801": "AAPL",
+                    "\u80a1\u7968\u540d\u79f0": "Apple",
+                    "\u5e95\u5c42\u5e02\u573a": "US",
+                    "\u7ec4\u5408\u7a7f\u900f\u6743\u91cd%": 60.0,
+                    "\u0045\u0054\u0046\u5185\u6743\u91cd%": 60.0,
+                }
+            ]
+        )
+        metrics = pd.DataFrame([{"ETF\u4ee3\u7801": "PORTFOLIO"}])
+        config = self.enhanced.ConstraintConfig(target_us_weight=50.0)
+
+        checks = self.enhanced.build_constraint_checks(detail, metrics, pd.DataFrame(), config)
+        row = checks[checks["\u7ea6\u675f"].eq("\u7f8e\u80a1\u6bd4\u4f8b\u7ea6\u675f")].iloc[0]
+
+        self.assertAlmostEqual(row["\u5b9e\u9645\u503c"], 60.0)
+        self.assertEqual(row["\u7ed3\u679c"], "\u901a\u8fc7")
+
+    def test_run_pcf_metrics_us_final_table_from_selected_metrics(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            pd.DataFrame(
+                [
+                    {
+                        "ETF\u4ee3\u7801": "513100",
+                        "ETF\u540d\u79f0": "Nasdaq ETF",
+                        "\u6301\u4ed3\u671f": "PCF:20260626",
+                        "\u6301\u4ed3\u6765\u6e90": "sse_pcf_us",
+                        "\u80a1\u7968\u6743\u91cd\u5408\u8ba1%": 98.5,
+                        "\u80a1\u606f\u7387%": 1.2,
+                        "PE": 30,
+                        "PB": 6,
+                        "\u5e74\u5316\u6536\u76ca%": 8,
+                        "\u7d22\u63d0\u8bfa\u6bd4\u7387": 1.1,
+                        "\u6ce2\u52a8\u7387%": 20,
+                        "\u8fd1\u534a\u5e74\u6536\u76ca%": 3,
+                        "\u8fd1\u4e00\u5e74\u6536\u76ca%": 7,
+                        "\u8fd13\u5e74\u6536\u76ca%": 25,
+                        "\u6536\u76ca\u6765\u6e90": "eastmoney_nav",
+                        "\u6536\u76ca\u533a\u95f4": "window",
+                        "\u98ce\u9669\u6307\u6807\u533a\u95f4": "risk",
+                        "PE\u8986\u76d6\u6743\u91cd%": 90,
+                        "\u8d1fPE\u6743\u91cd%": 0,
+                    },
+                    {"ETF\u4ee3\u7801": "PORTFOLIO"},
+                ]
+            ).to_csv(out_dir / "metrics_summary.csv", index=False, encoding="utf-8-sig")
+
+            report = self.runner.build_final_tables(out_dir, "us")
+
+            self.assertEqual(len(report), 1)
+            self.assertTrue((out_dir / self.runner.FINAL_CSV).exists())
+            self.assertTrue((out_dir / self.runner.FINAL_XLSX).exists())
+            self.assertEqual(report.iloc[0]["ETF\u4ee3\u7801"], "513100")
+            self.assertAlmostEqual(report.iloc[0]["\u7f8e\u80a1\u6301\u4ed3\u6743\u91cd%"], 98.5)
 
 
 if __name__ == "__main__":

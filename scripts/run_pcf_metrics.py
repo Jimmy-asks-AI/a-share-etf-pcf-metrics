@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--code-column", default="ETF代码", help="ETF code column in --input.")
     parser.add_argument("--etf", action="append", help="ETF code. Repeat or use comma-separated values. When set, --input is ignored.")
     parser.add_argument("--out-dir", default="lookthrough-hk-all-ranking-pcf-risk", help="Output directory.")
+    parser.add_argument("--market", choices=("hk", "us"), default="hk", help="Underlying market workflow. Default: hk.")
     parser.add_argument("--holdings-source", choices=("auto", "pcf", "reported"), default="auto")
     parser.add_argument("--alt-limit", type=int, default=0)
     parser.add_argument("--sleep", type=float, default=0.05, help="Sleep seconds between constituent valuation requests.")
@@ -56,6 +57,23 @@ def load_codes(args: argparse.Namespace) -> list[str]:
 
 
 def run_lookthrough(args: argparse.Namespace, codes: list[str], out_dir: Path) -> None:
+    if args.market == "us":
+        script = Path(__file__).with_name("selected_etf_lookthrough.py")
+        subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--etf",
+                ",".join(codes),
+                "--markets",
+                "us",
+                "--out-dir",
+                str(out_dir),
+            ],
+            check=True,
+        )
+        return
+
     script = Path(__file__).with_name("pcf_lookthrough.py")
     command = [
         sys.executable,
@@ -76,7 +94,7 @@ def run_lookthrough(args: argparse.Namespace, codes: list[str], out_dir: Path) -
     subprocess.run(command, check=True)
 
 
-def build_final_tables(out_dir: Path) -> pd.DataFrame:
+def build_hk_final_tables(out_dir: Path) -> pd.DataFrame:
     summary_path = out_dir / "summary.csv"
     if not summary_path.exists():
         raise SystemExit(f"Missing look-through summary: {summary_path}")
@@ -159,6 +177,66 @@ def build_final_tables(out_dir: Path) -> pd.DataFrame:
     return report
 
 
+def build_us_final_tables(out_dir: Path) -> pd.DataFrame:
+    metrics_path = out_dir / "metrics_summary.csv"
+    if not metrics_path.exists():
+        raise SystemExit(f"Missing selected ETF metrics summary: {metrics_path}")
+    metrics = pd.read_csv(metrics_path, encoding="utf-8-sig")
+    metrics = metrics[metrics["ETF代码"].astype(str).ne("PORTFOLIO")].copy()
+    numeric_columns = [
+        "股票权重合计%",
+        "股息率%",
+        "PE",
+        "PB",
+        "年化收益%",
+        "索提诺比率",
+        "波动率%",
+        "近半年收益%",
+        "近一年收益%",
+        "近3年收益%",
+        "PE覆盖权重%",
+        "负PE权重%",
+    ]
+    for column in numeric_columns:
+        if column in metrics.columns:
+            metrics[column] = pd.to_numeric(metrics[column], errors="coerce")
+    metrics = metrics.sort_values("股息率%", ascending=False, na_position="last").reset_index(drop=True)
+    report = pd.DataFrame(
+        {
+            "排名_按股息率": range(1, len(metrics) + 1),
+            "ETF代码": metrics["ETF代码"].astype(str).str.zfill(6),
+            "ETF名称": metrics["ETF名称"],
+            "持仓期": metrics["持仓期"],
+            "持仓来源": metrics["持仓来源"],
+            "美股持仓权重%": metrics["股票权重合计%"],
+            "股息率%": metrics["股息率%"],
+            "PE": metrics["PE"],
+            "PB": metrics["PB"],
+            "年化收益%": metrics["年化收益%"],
+            "索提诺比率": metrics["索提诺比率"],
+            "波动率%": metrics["波动率%"],
+            "近半年收益%": metrics["近半年收益%"],
+            "近一年收益%": metrics["近一年收益%"],
+            "近3年收益%": metrics["近3年收益%"],
+            "收益来源": metrics["收益来源"],
+            "收益区间": metrics["收益区间"],
+            "风险指标区间": metrics["风险指标区间"],
+            "PE覆盖权重%": metrics["PE覆盖权重%"],
+            "负PE权重%": metrics["负PE权重%"],
+        }
+    )
+    report.to_csv(out_dir / FINAL_CSV, index=False, encoding="utf-8-sig")
+    with pd.ExcelWriter(out_dir / FINAL_XLSX, engine="openpyxl") as writer:
+        report.to_excel(writer, index=False, sheet_name="ETF穿透汇总")
+    return report
+
+
+def build_final_tables(out_dir: Path, market: str = "hk") -> pd.DataFrame:
+    if market == "us":
+        return build_us_final_tables(out_dir)
+    return build_hk_final_tables(out_dir)
+
+
 def clean_intermediates(out_dir: Path) -> None:
     keep = {FINAL_CSV, FINAL_XLSX}
     for path in out_dir.iterdir():
@@ -172,7 +250,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     codes = load_codes(args)
     run_lookthrough(args, codes, out_dir)
-    report = build_final_tables(out_dir)
+    report = build_final_tables(out_dir, args.market)
     if not args.keep_intermediates:
         clean_intermediates(out_dir)
     print(out_dir / FINAL_XLSX)

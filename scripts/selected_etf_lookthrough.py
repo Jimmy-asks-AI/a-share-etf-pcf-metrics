@@ -38,6 +38,7 @@ from pcf_enhanced_analytics import (
 WORKSPACE = Path(__file__).resolve().parent
 DEFAULT_A_SCRIPT = WORKSPACE / "run_a_share_dividend_etf_pcf_metrics.py"
 DEFAULT_HK_SCRIPT = WORKSPACE / "pcf_lookthrough.py"
+DEFAULT_US_SCRIPT = WORKSPACE / "us_etf_lookthrough.py"
 
 C_STOCK_CODE = "\u80a1\u7968\u4ee3\u7801"
 C_STOCK_NAME = "\u80a1\u7968\u540d\u79f0"
@@ -205,7 +206,7 @@ def parse_modes(raw: str | None, count: int) -> list[str]:
         values = values * count
     if len(values) != count:
         raise ValueError(f"--markets count ({len(values)}) must match ETF count ({count}).")
-    allowed = {"auto", "a", "hk"}
+    allowed = {"auto", "a", "hk", "us"}
     invalid = sorted(set(values) - allowed)
     if invalid:
         raise ValueError(f"Invalid --markets value(s): {', '.join(invalid)}")
@@ -318,33 +319,72 @@ def get_hk_stock_holdings(hk_module: Any, etf: str) -> tuple[pd.DataFrame, dict[
     return result, meta
 
 
+def get_us_stock_holdings(us_module: Any, etf: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    holdings, period, source = retry(lambda: us_module.get_pcf_holdings(etf))
+    if C_STOCK_PRICE not in holdings.columns and C_PRICE in holdings.columns:
+        holdings[C_STOCK_PRICE] = holdings[C_PRICE]
+    needed = [C_STOCK_CODE, C_STOCK_NAME, C_MARKET, C_A_WEIGHT, C_STOCK_PRICE, C_WEIGHT_SOURCE]
+    for column in needed + [C_DETAIL_SOURCE, C_VALUATION_ERROR]:
+        if column not in holdings.columns:
+            holdings[column] = None
+    result = holdings.loc[holdings[C_MARKET].eq("US"), needed + [C_DETAIL_SOURCE, C_VALUATION_ERROR]].copy()
+    result[C_STOCK_CODE] = result[C_STOCK_CODE].astype(str).map(us_module.normalize_us_ticker)
+    result[C_MARKET] = "US"
+    result.rename(columns={C_A_WEIGHT: C_ETF_INNER_WEIGHT}, inplace=True)
+    result[C_ETF_INNER_WEIGHT] = pd.to_numeric(result[C_ETF_INNER_WEIGHT], errors="coerce")
+    result[C_STOCK_PRICE] = pd.to_numeric(result[C_STOCK_PRICE], errors="coerce")
+    result = result.dropna(subset=[C_ETF_INNER_WEIGHT])
+    if result.empty:
+        raise RuntimeError("US parser returned no weighted US stock rows")
+    meta = {
+        C_PERIOD: period,
+        C_SOURCE: source,
+        C_MODE: "us",
+        C_STOCK_COUNT: int(len(result)),
+        "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%": float(result[C_ETF_INNER_WEIGHT].sum()),
+    }
+    return result, meta
+
+
 def resolve_holdings(
     selected: SelectedETF,
     a_module: Any,
     hk_module: Any,
+    us_module: Any,
     min_auto_weight: float,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if selected.mode == "hk":
         return get_hk_stock_holdings(hk_module, selected.code)
     if selected.mode == "a":
         return get_a_stock_holdings(a_module, selected.code)
+    if selected.mode == "us":
+        return get_us_stock_holdings(us_module, selected.code)
 
-    hk_error = ""
+    candidates: list[tuple[pd.DataFrame, dict[str, Any]]] = []
+    errors: dict[str, str] = {}
     try:
         hk_df, hk_meta = get_hk_stock_holdings(hk_module, selected.code)
         if not hk_df.empty and hk_meta["\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%"] >= min_auto_weight:
             return hk_df, hk_meta
+        candidates.append((hk_df, hk_meta))
     except Exception as exc:  # noqa: BLE001
-        hk_error = str(exc)
+        errors["HK"] = str(exc)
 
     try:
         a_df, a_meta = get_a_stock_holdings(a_module, selected.code)
-        a_meta["auto_hk_error"] = hk_error
-        return a_df, a_meta
-    except Exception as a_exc:
-        if hk_error:
-            raise RuntimeError(f"auto mode failed. HK parser: {hk_error}; A parser: {a_exc}") from a_exc
-        raise
+        candidates.append((a_df, a_meta))
+    except Exception as exc:  # noqa: BLE001
+        errors["A"] = str(exc)
+
+    try:
+        us_df, us_meta = get_us_stock_holdings(us_module, selected.code)
+        candidates.append((us_df, us_meta))
+    except Exception as exc:  # noqa: BLE001
+        errors["US"] = str(exc)
+
+    if candidates:
+        return max(candidates, key=lambda item: item[1].get("\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%", 0) or 0)
+    raise RuntimeError("auto mode failed. " + "; ".join(f"{market} parser: {error}" for market, error in errors.items()))
 
 
 def as_float(value: Any) -> float | None:
@@ -620,6 +660,7 @@ def enrich_detail_stock_metrics(
     detail: pd.DataFrame,
     a_module: Any,
     hk_module: Any,
+    us_module: Any,
     workers: int,
     hk_alt_limit: int,
     hk_sleep: float,
@@ -696,6 +737,28 @@ def enrich_detail_stock_metrics(
                 C_VALUATION_ERROR: item.valuation_error,
             }
 
+    us_detail = detail[detail[C_UNDERLYING_MARKET].eq("US")]
+    if not us_detail.empty:
+        us_codes = sorted({us_module.normalize_us_ticker(code) for code in us_detail[C_STOCK_CODE].astype(str)})
+        try:
+            us_metrics = us_module.build_metrics(us_codes, workers=workers)
+        except Exception as exc:  # noqa: BLE001
+            print(f"US stock metric lookups failed: {exc}")
+            us_metrics = {}
+        for code in us_codes:
+            item = us_metrics.get(code)
+            if item is None:
+                continue
+            stock_metrics[("US", code)] = {
+                C_STOCK_PRICE: item.price,
+                C_STOCK_PE: item.pe,
+                C_STOCK_PB: item.pb,
+                C_STOCK_DY: item.dividend_yield_pct,
+                C_DIVIDEND_SOURCE: item.source,
+                C_VALUATION_SOURCE: item.source,
+                C_VALUATION_ERROR: item.error,
+            }
+
     for idx, row in detail.iterrows():
         market = str(row.get(C_UNDERLYING_MARKET) or "")
         code = str(row.get(C_STOCK_CODE) or "")
@@ -703,6 +766,8 @@ def enrich_detail_stock_metrics(
             code = code.zfill(5)
         elif market == "A":
             code = code.zfill(6)
+        elif market == "US":
+            code = us_module.normalize_us_ticker(code)
         metric = stock_metrics.get((market, code))
         if not metric:
             continue
@@ -715,6 +780,7 @@ def build_tables(
     selections: list[SelectedETF],
     a_module: Any,
     hk_module: Any,
+    us_module: Any,
     name_map: dict[str, str],
     min_auto_weight: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -722,7 +788,7 @@ def build_tables(
     etf_rows: list[dict[str, Any]] = []
     for selected in selections:
         print(f"Reading latest PCF for ETF {selected.code} mode={selected.mode}...")
-        holdings, meta = resolve_holdings(selected, a_module, hk_module, min_auto_weight)
+        holdings, meta = resolve_holdings(selected, a_module, hk_module, us_module, min_auto_weight)
         etf_name = name_map.get(selected.code, "")
         for _, row in holdings.iterrows():
             etf_weight_pct = selected.weight * 100
@@ -742,6 +808,8 @@ def build_tables(
                     C_PERIOD: meta[C_PERIOD],
                     C_SOURCE: meta[C_SOURCE],
                     C_WEIGHT_SOURCE: row.get(C_WEIGHT_SOURCE, ""),
+                    C_DETAIL_SOURCE: row.get(C_DETAIL_SOURCE, ""),
+                    C_VALUATION_ERROR: row.get(C_VALUATION_ERROR, ""),
                 }
             )
         etf_rows.append(
@@ -816,6 +884,7 @@ def add_metrics_to_tables(
     etf_summary: pd.DataFrame,
     a_module: Any,
     hk_module: Any,
+    us_module: Any,
     workers: int,
     hk_alt_limit: int,
     hk_sleep: float,
@@ -829,13 +898,14 @@ def add_metrics_to_tables(
         detail,
         a_module=a_module,
         hk_module=hk_module,
+        us_module=us_module,
         workers=workers,
         hk_alt_limit=hk_alt_limit,
         hk_sleep=hk_sleep,
     )
     summary = rebuild_summary_from_detail(detail)
 
-    ak_module = getattr(a_module, "ak", None) or getattr(hk_module, "ak", None)
+    ak_module = getattr(a_module, "ak", None) or getattr(hk_module, "ak", None) or getattr(us_module, "ak", None)
     metric_rows: list[dict[str, Any]] = []
     etf_summary = etf_summary.copy()
     for idx, etf_row in etf_summary.iterrows():
@@ -929,6 +999,7 @@ def constraint_config_from_args(args: argparse.Namespace) -> ConstraintConfig:
         max_drawdown=getattr(args, "max_drawdown", None),
         target_a_weight=getattr(args, "target_a_weight", None),
         target_hk_weight=getattr(args, "target_hk_weight", None),
+        target_us_weight=getattr(args, "target_us_weight", None),
     )
 
 
@@ -1030,11 +1101,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weights", help="Optional weights. Percent or decimal. Defaults to equal weights.")
     parser.add_argument(
         "--markets",
-        help="Optional per-ETF modes: auto, hk, a. One value applies to all; or provide one per ETF. Default: auto.",
+        help="Optional per-ETF modes: auto, hk, a, us. One value applies to all; or provide one per ETF. Default: auto.",
     )
     parser.add_argument("--out-dir", default="selected_etf_lookthrough_output", help="Output directory.")
     parser.add_argument("--a-script", default=str(DEFAULT_A_SCRIPT), help="Path to A-share PCF helper script.")
     parser.add_argument("--hk-script", default=str(DEFAULT_HK_SCRIPT), help="Path to HK PCF helper script.")
+    parser.add_argument("--us-script", default=str(DEFAULT_US_SCRIPT), help="Path to US-stock PCF helper script.")
     parser.add_argument(
         "--min-auto-weight",
         type=float,
@@ -1064,6 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-drawdown", type=float, help="Constraint check: maximum drawdown lower bound, e.g. -20 means no worse than -20%%.")
     parser.add_argument("--target-a-weight", type=float, help="Constraint check: minimum A-share look-through weight percent.")
     parser.add_argument("--target-hk-weight", type=float, help="Constraint check: minimum Hong Kong look-through weight percent.")
+    parser.add_argument("--target-us-weight", type=float, help="Constraint check: minimum US-stock look-through weight percent.")
     return parser
 
 
@@ -1073,11 +1146,13 @@ def main() -> int:
     selections = selected_etfs(args.etf, args.weights, args.markets)
     a_module = import_module(Path(args.a_script), "selected_etf_a_pcf")
     hk_module = import_module(Path(args.hk_script), "selected_etf_hk_pcf")
+    us_module = import_module(Path(args.us_script), "selected_etf_us_pcf")
     name_map = maybe_load_name_map()
     summary, detail, etf_summary = build_tables(
         selections,
         a_module=a_module,
         hk_module=hk_module,
+        us_module=us_module,
         name_map=name_map,
         min_auto_weight=args.min_auto_weight,
     )
@@ -1090,6 +1165,7 @@ def main() -> int:
             etf_summary=etf_summary,
             a_module=a_module,
             hk_module=hk_module,
+            us_module=us_module,
             workers=args.metrics_workers,
             hk_alt_limit=args.hk_alt_limit,
             hk_sleep=args.hk_sleep,

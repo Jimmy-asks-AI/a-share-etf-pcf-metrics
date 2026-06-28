@@ -42,6 +42,7 @@ class ConstraintConfig:
     max_drawdown: float | None = None
     target_a_weight: float | None = None
     target_hk_weight: float | None = None
+    target_us_weight: float | None = None
 
 
 def to_float(value: Any) -> float | None:
@@ -89,6 +90,8 @@ def numeric_column(df: pd.DataFrame, column: str) -> pd.Series:
 
 
 def classify_board(market: str, code: str) -> str:
+    if market == "US":
+        return "美股"
     code = re.sub(r"\D", "", str(code))
     if market == "HK":
         return "港股"
@@ -468,6 +471,7 @@ def build_constraint_checks(
     market_weights = df.groupby(C_MARKET)[C_PORTFOLIO_WEIGHT].sum().to_dict() if not df.empty else {}
     add("A股比例约束", to_float(market_weights.get("A")), ">=", config.target_a_weight)
     add("港股比例约束", to_float(market_weights.get("HK")), ">=", config.target_hk_weight)
+    add("美股比例约束", to_float(market_weights.get("US")), ">=", config.target_us_weight)
     checks.append({"约束": "自动筛选满足条件ETF组合", "实际值": None, "条件": "", "单位": "", "结果": "当前脚本对已选ETF做约束检查；自动筛选需要候选ETF池"})
     checks.append({"约束": "ETF组合再平衡建议", "实际值": None, "条件": "", "单位": "", "结果": "输出当前超限项；权重优化需启用候选池与目标函数"})
     return pd.DataFrame(checks)

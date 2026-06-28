@@ -1,18 +1,19 @@
 ---
 name: a-share-etf-pcf-metrics
-description: Generate deterministic A-share listed ETF PCF look-through metric tables, including dividend yield, PE, PB, return/risk metrics, holding structure, industry/theme exposure, valuation buckets, ETF overlap, PCF quality checks, cache manifests, and portfolio constraint checks. Use for Hong Kong/H-share/Hang Seng ETF ranking, A-share dividend ETF look-through, or selected ETF portfolio look-through without model-based calculation.
+description: Generate deterministic A-share listed ETF PCF look-through metric tables, including dividend yield, PE, PB, return/risk metrics, holding structure, industry/theme exposure, valuation buckets, ETF overlap, PCF quality checks, cache manifests, and portfolio constraint checks. Use for Hong Kong/H-share/Hang Seng ETF ranking, A-share dividend ETF look-through, US-stock ETF look-through, or selected ETF portfolio look-through without model-based calculation.
 ---
 
 # A-share ETF PCF Metrics
 
 ## Overview
 
-Use this skill when the user wants deterministic PCF look-through calculations for A-share listed ETFs. The bundled scripts read exchange PCF baskets, compute constituent-level valuation/dividend data, and aggregate ETF or portfolio metrics. The selected ETF workflow also produces audit tables for concentration, market/board split, industry/theme exposure, valuation buckets, risk diagnostics, overlap, PCF quality, cross-source coverage, and constraint checks.
+Use this skill when the user wants deterministic PCF look-through calculations for A-share listed ETFs. The bundled scripts read exchange PCF baskets, compute constituent-level valuation/dividend data, and aggregate ETF or portfolio metrics for A-share, Hong Kong, and US-stock underlyings when exposed by SSE/SZSE PCF files. The selected ETF workflow also produces audit tables for concentration, market/board split, industry/theme exposure, valuation buckets, risk diagnostics, overlap, PCF quality, cross-source coverage, and constraint checks.
 
-Two workflows are supported:
+Three workflows are supported:
 
-- Batch HK ETF ranking: `scripts/run_pcf_metrics.py`
+- Batch HK or US ETF ranking: `scripts/run_pcf_metrics.py`
 - Selected ETF or ETF portfolio look-through: `scripts/selected_etf_lookthrough.py`
+- US-listed ETF ticker look-through: `scripts/us_listed_etf_lookthrough.py`
 
 Resolve the skill directory first. `$SKILL_DIR` means the directory containing this `SKILL.md`; if the current directory is the skill/repo directory, use:
 
@@ -42,6 +43,41 @@ Default final outputs:
 - `pcf_full_metrics_table.csv`
 
 By default, intermediate per-ETF CSV/JSON/MD files are removed. Use `--keep-intermediates` while debugging, auditing, or validating source data.
+
+## Batch US ETF Ranking
+
+Run explicit US-stock/QDII ETF codes:
+
+```powershell
+python "$SKILL_DIR\scripts\run_pcf_metrics.py" --market us --etf 513100,513500 --out-dir lookthrough-us-pcf-risk
+```
+
+Default final outputs are still `pcf_full_metrics_table.xlsx` and `pcf_full_metrics_table.csv`. Use `--keep-intermediates` to retain selected-workflow diagnostics.
+
+## US-listed ETF Ticker Look-through
+
+Use this workflow when the ETF itself is listed in the US, for example `QQQ.US` or `DRAM.US`. Do not pass these tickers to `selected_etf_lookthrough.py --etf`; that command expects A-share listed six-digit ETF codes.
+
+```powershell
+python "$SKILL_DIR\scripts\us_listed_etf_lookthrough.py" --ticker QQQ.US --out-dir us-etf-output
+python "$SKILL_DIR\scripts\us_listed_etf_lookthrough.py" --ticker QQQ.US,DRAM.US --weights 50,50 --out-dir us-etf-portfolio-output
+python "$SKILL_DIR\scripts\us_listed_etf_lookthrough.py" --ticker QQQ.US --skip-metrics --out-dir us-qqq-holdings
+python "$SKILL_DIR\scripts\us_listed_etf_lookthrough.py" --ticker QQQ.US,DRAM.US --full-output --out-dir us-etf-full-audit
+```
+
+Compact default outputs: `lookthrough_detail.csv`, `lookthrough_summary.csv`, `etf_summary.csv`, `metrics_summary.csv`, `lookthrough_report.xlsx`, and `run_manifest.json`. Use `--full-output` only when auxiliary CSV, Markdown, HTML, and extra audit files are needed.
+
+Current source behavior:
+
+- US-listed ETF ticker resolution first uses the SEC mutual fund/class ticker map (`company_tickers_mf.json`), then the SEC exchange ticker map, so it is not limited to hand-coded NYSE Arca/Nasdaq/Cboe examples.
+- SEC NPORT fallback provides full holdings when available; NPORT is complete but delayed.
+- Roundhill ETFs such as `DRAM` use issuer daily holdings CSV files when available.
+- `QQQ` can use SEC NPORT as a full-holdings fallback when the Invesco API blocks script requests.
+- Constituent PE/PB, price, and dividend yield use Yahoo quoteSummary with crumb authentication when available.
+- Sector and industry use Nasdaq quote endpoints when available.
+- ETF return/risk metrics use Nasdaq chart data when available; portfolio risk is recomputed from the combined ETF price curves.
+- Default mode does not write cache files. Add `--cache` to store holdings, constituent metrics, and ETF price histories under `out-dir/cache`; use `--refresh-cache` to clear cache files before a cached run.
+- `--lookback-days` is accepted as an alias for `--nav-lookback-days`.
 
 ## Selected ETF Portfolio
 
@@ -75,12 +111,25 @@ Selected workflow outputs:
 - `lookthrough_report.xlsx`: workbook containing the base sheets and enhanced sheets.
 - `enhanced_report.md`, `enhanced_report.html`, `run_summary.json`, `run_manifest.json`.
 
-`--weights` accepts percentages or decimals and is normalized internally. If omitted, ETFs are equal weighted. `--markets` can force `auto`, `hk`, or `a`; use `auto` unless the parser chooses the wrong market.
+`--weights` accepts percentages or decimals and is normalized internally. If omitted, ETFs are equal weighted. `--markets` can force `auto`, `hk`, `a`, or `us`; use `auto` unless the parser chooses the wrong market.
+
+Run a US ETF:
+
+```powershell
+python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 513100 --markets us --out-dir selected-us-etf-output
+```
+
+Run a mixed A/H/US portfolio:
+
+```powershell
+python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,513100 --markets a,hk,us --weights 40,30,30 --out-dir selected-global-etf-output
+```
 
 Useful selected-workflow options:
 
 - `--max-stock-weight 7`: flag single-stock look-through exposure above 7%.
-- `--max-industry-weight`, `--min-dividend-yield`, `--max-pe`, `--max-pb`, `--max-drawdown`, `--target-a-weight`, `--target-hk-weight`: portfolio constraint checks.
+- `--max-industry-weight`, `--min-dividend-yield`, `--max-pe`, `--max-pb`, `--max-drawdown`, `--target-a-weight`, `--target-hk-weight`, `--target-us-weight`: portfolio constraint checks.
+- `--us-script`: override the US-stock PCF helper path.
 - `--cache` / `--no-cache`: write or skip the current holdings snapshot under `cache/`; cache is on by default.
 - `--refresh-cache`: remove old `holdings_*.csv` snapshots in the selected output cache before the run.
 - `--compare`, `--portfolio`, `--industry`, `--theme`, `--risk`, `--html-report`: accepted semantic flags; the corresponding enhanced outputs are generated by default.
@@ -94,6 +143,8 @@ Useful selected-workflow options:
 - Portfolio return/risk metrics: calculated from the combined ETF NAV/price curve, not from weighted precomputed ETF metrics.
 - Three-year return stays blank when available history is too short.
 - Industry/theme fields are rule estimates unless an official external mapping is supplied later; the output marks this data-source status explicitly.
+- US tickers are uppercased but not zero-filled; tickers such as `AAPL`, `MSFT`, `NVDA`, `BRK.B`, and `BRK-B` stay ticker-shaped.
+- A-share-listed US/QDII PE/PB/dividend yield are best-effort AkShare lookups. Direct US-listed ETF constituent PE/PB/price/dividend fields use Yahoo quoteSummary when available, with Nasdaq for sector/industry fallback.
 
 ## PCF Rules
 
@@ -102,6 +153,7 @@ Read `references/pcf-method.md` before changing source priority or weight formul
 - Shanghai ETF PCF: `SUBSTITUTION_CASH_AMOUNT / NAVPERCU`.
 - Shenzhen cash-substitute rows: `CreationCashSubstitute / (1 + PremiumRatio) / NAVperCU`.
 - Shenzhen in-kind HK rows with zero substitute cash: `ComponentShare * HK spot price * HKD/CNY / NAVperCU`.
+- US rows prefer PCF cash substitute amount divided by `NAVperCU`; when only quantity exists, weight may be estimated with `ComponentShare * US latest price * USD/CNY / NAVperCU` and that formula is recorded in `权重来源`.
 - When a Shenzhen download row exposes multiple XML candidates, choose the XML with the most relevant stock components.
 
 ## References
@@ -120,14 +172,15 @@ Install missing packages only when needed:
 python -m pip install -r "$SKILL_DIR\requirements.txt"
 ```
 
-Network access is required for exchange PCF files, stock valuation/dividend data, HK spot prices, HKD/CNY FX quotes, and ETF return histories.
+Network access is required for exchange PCF files, stock valuation/dividend data, HK/US spot prices, HKD/CNY and USD/CNY FX quotes, and ETF return histories.
 
 ## Validation
 
 Fast offline checks:
 
 ```powershell
-python -m py_compile "$SKILL_DIR\scripts\pcf_common.py" "$SKILL_DIR\scripts\pcf_enhanced_analytics.py" "$SKILL_DIR\scripts\run_pcf_metrics.py" "$SKILL_DIR\scripts\pcf_lookthrough.py" "$SKILL_DIR\scripts\run_a_share_dividend_etf_pcf_metrics.py" "$SKILL_DIR\scripts\selected_etf_lookthrough.py"
+python -m py_compile "$SKILL_DIR\scripts\pcf_common.py" "$SKILL_DIR\scripts\pcf_enhanced_analytics.py" "$SKILL_DIR\scripts\run_pcf_metrics.py" "$SKILL_DIR\scripts\pcf_lookthrough.py" "$SKILL_DIR\scripts\run_a_share_dividend_etf_pcf_metrics.py" "$SKILL_DIR\scripts\selected_etf_lookthrough.py" "$SKILL_DIR\scripts\us_etf_lookthrough.py"
+python -m py_compile "$SKILL_DIR\scripts\us_listed_etf_lookthrough.py"
 python -m unittest discover -s "$SKILL_DIR\tests"
 ```
 
@@ -135,6 +188,8 @@ Network smoke test:
 
 ```powershell
 python "$SKILL_DIR\scripts\run_pcf_metrics.py" --etf 513690,159569 --out-dir pcf-metrics-smoke-test
+python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 513100 --markets us --skip-metrics --out-dir selected-us-smoke-test
+python "$SKILL_DIR\scripts\us_listed_etf_lookthrough.py" --ticker QQQ.US,DRAM.US --out-dir us-listed-smoke-test
 ```
 
 Expected batch result: final `.csv` and `.xlsx`; intermediate files only when `--keep-intermediates` is set.
