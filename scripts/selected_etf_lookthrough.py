@@ -666,17 +666,31 @@ def summarize_price_series(series: pd.Series, source: str) -> dict[str, Any]:
     }
 
 
-def portfolio_return_metrics(selections: list[SelectedETF], ak_module: Any, lookback_days: int) -> dict[str, Any]:
+def selected_price_series(selected: SelectedETF, ak_module: Any, us_listed_module: Any | None, lookback_days: int) -> tuple[pd.Series, str]:
+    if selected.mode == "us_listed":
+        if us_listed_module is None:
+            raise RuntimeError("us_listed mode requires --us-listed-script for return metrics")
+        ticker = us_listed_module.normalize_us_ticker(selected.code)
+        series, source = us_listed_module.price_series(ticker, lookback_days, cache_dir=None)
+        if len(series) < 30:
+            raise RuntimeError(f"{source}: {len(series)} observations")
+        return series, source
+    return fetch_etf_price_series(ak_module, selected.code, lookback_days=lookback_days)
+
+
+def portfolio_return_metrics(selections: list[SelectedETF], ak_module: Any, us_listed_module: Any | None, lookback_days: int) -> dict[str, Any]:
     weight_by_code: dict[str, float] = {}
+    selected_by_code: dict[str, SelectedETF] = {}
     for selected in selections:
         weight_by_code[selected.code] = weight_by_code.get(selected.code, 0.0) + selected.weight
+        selected_by_code[selected.code] = selected
 
     series_map: dict[str, pd.Series] = {}
     source_map: dict[str, str] = {}
     errors: dict[str, str] = {}
     for etf in weight_by_code:
         try:
-            series, source = fetch_etf_price_series(ak_module, etf, lookback_days=lookback_days)
+            series, source = selected_price_series(selected_by_code[etf], ak_module, us_listed_module, lookback_days=lookback_days)
             series_map[etf] = series.rename(etf)
             source_map[etf] = source
         except Exception as exc:  # noqa: BLE001
@@ -702,6 +716,7 @@ def enrich_detail_stock_metrics(
     a_module: Any,
     hk_module: Any,
     us_module: Any,
+    us_listed_module: Any | None,
     workers: int,
     hk_alt_limit: int,
     hk_sleep: float,
@@ -782,7 +797,23 @@ def enrich_detail_stock_metrics(
     if not us_detail.empty:
         us_codes = sorted({us_module.normalize_us_ticker(code) for code in us_detail[C_STOCK_CODE].astype(str)})
         try:
-            us_metrics = us_module.build_metrics(us_codes, workers=workers)
+            if us_listed_module is not None:
+                us_frame = pd.DataFrame({us_listed_module.C_STOCK_CODE: us_codes, us_listed_module.C_MARKET: "US"})
+                enriched = us_listed_module.enrich_metrics(us_frame, skip_metrics=False, workers=workers)
+                us_metrics = {
+                    str(row[us_listed_module.C_STOCK_CODE]): {
+                        C_STOCK_PRICE: row.get(us_listed_module.C_PRICE),
+                        C_STOCK_PE: row.get(us_listed_module.C_PE),
+                        C_STOCK_PB: row.get(us_listed_module.C_PB),
+                        C_STOCK_DY: row.get(us_listed_module.C_DY),
+                        C_DIVIDEND_SOURCE: row.get(us_listed_module.C_VAL_SOURCE, ""),
+                        C_VALUATION_SOURCE: row.get(us_listed_module.C_VAL_SOURCE, ""),
+                        C_VALUATION_ERROR: row.get(us_listed_module.C_VAL_ERROR, ""),
+                    }
+                    for _, row in enriched.iterrows()
+                }
+            else:
+                us_metrics = us_module.build_metrics(us_codes, workers=workers)
         except Exception as exc:  # noqa: BLE001
             print(f"US stock metric lookups failed: {exc}")
             us_metrics = {}
@@ -790,7 +821,7 @@ def enrich_detail_stock_metrics(
             item = us_metrics.get(code)
             if item is None:
                 continue
-            stock_metrics[("US", code)] = {
+            stock_metrics[("US", code)] = item if isinstance(item, dict) else {
                 C_STOCK_PRICE: item.price,
                 C_STOCK_PE: item.pe,
                 C_STOCK_PB: item.pb,
@@ -895,6 +926,14 @@ def safe_return_metrics(ak_module: Any, etf: str, lookback_days: int) -> dict[st
         return {C_RETURN_SOURCE: "", C_RETURN_ERROR: str(exc)}
 
 
+def safe_selected_return_metrics(selected: SelectedETF, ak_module: Any, us_listed_module: Any | None, lookback_days: int) -> dict[str, Any]:
+    try:
+        series, source = selected_price_series(selected, ak_module, us_listed_module, lookback_days=lookback_days)
+        return summarize_price_series(series, source)
+    except Exception as exc:  # noqa: BLE001
+        return {C_RETURN_SOURCE: "", C_RETURN_ERROR: str(exc)}
+
+
 def rebuild_summary_from_detail(detail: pd.DataFrame) -> pd.DataFrame:
     if detail.empty:
         return pd.DataFrame()
@@ -933,6 +972,7 @@ def add_metrics_to_tables(
     a_module: Any,
     hk_module: Any,
     us_module: Any,
+    us_listed_module: Any | None,
     workers: int,
     hk_alt_limit: int,
     hk_sleep: float,
@@ -947,6 +987,7 @@ def add_metrics_to_tables(
         a_module=a_module,
         hk_module=hk_module,
         us_module=us_module,
+        us_listed_module=us_listed_module,
         workers=workers,
         hk_alt_limit=hk_alt_limit,
         hk_sleep=hk_sleep,
@@ -960,7 +1001,8 @@ def add_metrics_to_tables(
         etf = str(etf_row[C_ETF_CODE]).zfill(6)
         etf_detail = detail[detail[C_ETF_CODE].astype(str).str.zfill(6).eq(etf)]
         valuation = aggregate_valuation_rows(valuation_rows_from_detail(etf_detail, C_ETF_INNER_WEIGHT))
-        returns = safe_return_metrics(ak_module, etf, lookback_days=lookback_days) if ak_module is not None else {}
+        mode = str(etf_row.get(C_MODE) or "")
+        returns = safe_selected_return_metrics(SelectedETF(etf, 1.0, mode), ak_module, us_listed_module, lookback_days=lookback_days)
         for key, value in {**valuation, **returns}.items():
             etf_summary.at[idx, key] = value
         metric_rows.append(
@@ -979,7 +1021,7 @@ def add_metrics_to_tables(
         )
 
     portfolio_valuation = aggregate_valuation_rows(valuation_rows_from_detail(detail, C_PORTFOLIO_WEIGHT))
-    portfolio_returns = portfolio_return_metrics(selections, ak_module, lookback_days=lookback_days) if ak_module is not None else {}
+    portfolio_returns = portfolio_return_metrics(selections, ak_module, us_listed_module, lookback_days=lookback_days) if ak_module is not None or us_listed_module is not None else {}
     metric_rows.append(
         {
             C_TYPE: "\u7ec4\u5408",
@@ -1217,6 +1259,7 @@ def main() -> int:
             a_module=a_module,
             hk_module=hk_module,
             us_module=us_module,
+            us_listed_module=us_listed_module,
             workers=args.metrics_workers,
             hk_alt_limit=args.hk_alt_limit,
             hk_sleep=args.hk_sleep,

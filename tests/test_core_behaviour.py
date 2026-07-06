@@ -261,6 +261,66 @@ class CoreBehaviourTests(unittest.TestCase):
         self.assertAlmostEqual(summary.iloc[0][self.selected.C_PORTFOLIO_WEIGHT], 3.0)
         self.assertEqual(summary.iloc[0]["\u8986\u76d6\u0045\u0054\u0046\u6570"], 2)
 
+    def test_portfolio_return_metrics_uses_us_listed_price_series(self) -> None:
+        dates = pd.date_range("2025-01-01", periods=40, freq="D")
+        us_listed = types.SimpleNamespace(
+            normalize_us_ticker=lambda value: str(value).upper().replace(".US", ""),
+            price_series=lambda ticker, lookback_days, cache_dir=None: (pd.Series(range(100, 140), index=dates, dtype=float), f"fixture_{ticker}"),
+        )
+
+        metrics = self.selected.portfolio_return_metrics(
+            [self.selected.SelectedETF("QQQ.US", 1.0, "us_listed")],
+            ak_module=None,
+            us_listed_module=us_listed,
+            lookback_days=90,
+        )
+
+        self.assertIn("fixture_QQQ", metrics[self.selected.C_RETURN_SOURCE])
+        self.assertNotIn(self.selected.C_RETURN_ERROR, metrics)
+
+    def test_us_metrics_prefer_us_listed_helper_when_available(self) -> None:
+        detail = pd.DataFrame(
+            [
+                {
+                    self.selected.C_UNDERLYING_MARKET: "US",
+                    self.selected.C_STOCK_CODE: "AAPL",
+                    self.selected.C_STOCK_NAME: "Apple",
+                    self.selected.C_PORTFOLIO_WEIGHT: 10.0,
+                    self.selected.C_ETF_INNER_WEIGHT: 10.0,
+                }
+            ]
+        )
+        us_listed = types.SimpleNamespace(
+            C_STOCK_CODE=self.selected.C_STOCK_CODE,
+            C_PRICE=self.selected.C_STOCK_PRICE,
+            C_PE=self.selected.C_STOCK_PE,
+            C_PB=self.selected.C_STOCK_PB,
+            C_DY=self.selected.C_STOCK_DY,
+            C_VAL_SOURCE=self.selected.C_VALUATION_SOURCE,
+            C_VAL_ERROR=self.selected.C_VALUATION_ERROR,
+            C_MARKET=self.selected.C_UNDERLYING_MARKET,
+            enrich_metrics=lambda frame, skip_metrics, workers=8: frame.assign(
+                **{
+                    self.selected.C_UNDERLYING_MARKET: frame[self.selected.C_UNDERLYING_MARKET],
+                    self.selected.C_STOCK_PRICE: 200.0,
+                    self.selected.C_STOCK_PE: 30.0,
+                    self.selected.C_STOCK_PB: 8.0,
+                    self.selected.C_STOCK_DY: 0.5,
+                    self.selected.C_VALUATION_SOURCE: "fixture_yahoo",
+                    self.selected.C_VALUATION_ERROR: "",
+                }
+            ),
+        )
+        old_build = self.us_metrics.build_metrics
+        try:
+            self.us_metrics.build_metrics = lambda *args, **kwargs: self.fail("fallback US metrics should not run")
+            enriched = self.selected.enrich_detail_stock_metrics(detail, object(), object(), self.us_metrics, us_listed, 1, 0, 0.0)
+        finally:
+            self.us_metrics.build_metrics = old_build
+
+        self.assertEqual(enriched.iloc[0][self.selected.C_VALUATION_SOURCE], "fixture_yahoo")
+        self.assertAlmostEqual(enriched.iloc[0][self.selected.C_STOCK_PE], 30.0)
+
     def test_sse_us_pcf_uses_cash_amount_over_nav(self) -> None:
         def fake_query(etf, sql):
             if sql == self.us_metrics.SSE_ETF_BASIC_SQL:
