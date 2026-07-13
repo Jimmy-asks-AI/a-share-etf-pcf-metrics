@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ class ConstraintConfig:
     target_a_weight: float | None = None
     target_hk_weight: float | None = None
     target_us_weight: float | None = None
+    min_metric_coverage: float = 80.0
 
 
 def to_float(value: Any) -> float | None:
@@ -185,11 +187,11 @@ def build_structure_analysis(detail: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         stock_group = df
     else:
         stock_group = (
-            df.groupby([C_STOCK_CODE, C_STOCK_NAME], as_index=False)
+            df.groupby([C_MARKET, C_STOCK_CODE], as_index=False)
             .agg(
                 **{
+                    C_STOCK_NAME: (C_STOCK_NAME, "first"),
                     C_PORTFOLIO_WEIGHT: (C_PORTFOLIO_WEIGHT, "sum"),
-                    C_MARKET: (C_MARKET, "first"),
                     "板块": ("板块", "first"),
                 }
             )
@@ -296,13 +298,6 @@ def build_profit_quality(detail: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {"指标": "市值加权隐含ROE", "数值": weighted_average(temp, "隐含ROE%", positive_only=True), "单位": "%", "覆盖权重%": weight_sum(temp, implied_roe.notna() & (implied_roe > 0)), "数据源": "PB/PE 推导，非财报直接 ROE"},
-            {"指标": "ROA", "数值": None, "单位": "%", "覆盖权重%": 0, "数据源": "当前脚本未接入财报 ROA 数据源"},
-            {"指标": "毛利率", "数值": None, "单位": "%", "覆盖权重%": 0, "数据源": "当前脚本未接入财报利润率数据源"},
-            {"指标": "净利率", "数值": None, "单位": "%", "覆盖权重%": 0, "数据源": "当前脚本未接入财报利润率数据源"},
-            {"指标": "营收增速", "数值": None, "单位": "%", "覆盖权重%": 0, "数据源": "当前脚本未接入财报增速数据源"},
-            {"指标": "净利润增速", "数值": None, "单位": "%", "覆盖权重%": 0, "数据源": "当前脚本未接入财报增速数据源"},
-            {"指标": "经营现金流质量", "数值": None, "单位": "", "覆盖权重%": 0, "数据源": "当前脚本未接入现金流数据源"},
-            {"指标": "研发费用率", "数值": None, "单位": "%", "覆盖权重%": 0, "数据源": "当前脚本未接入研发费用数据源"},
         ]
     )
 
@@ -315,9 +310,6 @@ def build_dividend_quality(detail: pd.DataFrame) -> pd.DataFrame:
         {"指标": "不分红股票权重", "数值": weight_sum(df, dy.fillna(-1).eq(0)), "单位": "%", "权重%": weight_sum(df, dy.fillna(-1).eq(0)), "说明": "股息率等于 0"},
         {"指标": "高股息股票权重>3%", "数值": weight_sum(df, dy > 3), "单位": "%", "权重%": weight_sum(df, dy > 3), "说明": "股息率大于 3%"},
         {"指标": "高股息股票权重>5%", "数值": weight_sum(df, dy > 5), "单位": "%", "权重%": weight_sum(df, dy > 5), "说明": "股息率大于 5%"},
-        {"指标": "近3年平均股息率", "数值": None, "单位": "%", "权重%": 0, "说明": "当前脚本未接入三年分红序列"},
-        {"指标": "连续分红年数", "数值": None, "单位": "年", "权重%": 0, "说明": "当前脚本未接入连续分红年数"},
-        {"指标": "分红增长率", "数值": None, "单位": "%", "权重%": 0, "说明": "当前脚本未接入多年度分红增长率"},
     ]
     return pd.DataFrame(rows)
 
@@ -357,10 +349,11 @@ def build_overlap_analysis(detail: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
             pd.DataFrame([{"ETF_A": codes[0] if codes else "", "ETF_B": "", "Jaccard相似度": None, "按权重重合度%": None, "说明": "少于两只 ETF，无法计算 ETF 间重合度"}]),
             pd.DataFrame(columns=["股票代码", "股票名称", "覆盖ETF数", "组合穿透权重%"]),
         )
+    df["_identity"] = df[C_MARKET].astype(str) + "|" + df[C_STOCK_CODE].astype(str)
     by_etf = {}
     for code in codes:
         part = df[df[C_ETF_CODE].astype(str).eq(code)]
-        by_etf[code] = part.set_index(C_STOCK_CODE)[C_ETF_INNER_WEIGHT].to_dict()
+        by_etf[code] = part.groupby("_identity")[C_ETF_INNER_WEIGHT].sum().to_dict()
     for i, left in enumerate(codes):
         for right in codes[i + 1 :]:
             left_set, right_set = set(by_etf[left]), set(by_etf[right])
@@ -368,9 +361,12 @@ def build_overlap_analysis(detail: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
             inter = left_set & right_set
             weighted = sum(min(to_float(by_etf[left].get(stock)) or 0, to_float(by_etf[right].get(stock)) or 0) for stock in inter)
             pair_rows.append({"ETF_A": left, "ETF_B": right, "Jaccard相似度": None if not union else len(inter) / len(union), "按权重重合度%": weighted, "共同持仓数": len(inter)})
-    grouped = df.groupby([C_STOCK_CODE, C_STOCK_NAME], as_index=False).agg(
-        覆盖ETF数=(C_ETF_CODE, "nunique"),
-        **{C_PORTFOLIO_WEIGHT: (C_PORTFOLIO_WEIGHT, "sum")},
+    grouped = df.groupby([C_MARKET, C_STOCK_CODE], as_index=False).agg(
+        **{
+            C_STOCK_NAME: (C_STOCK_NAME, "first"),
+            "覆盖ETF数": (C_ETF_CODE, "nunique"),
+            C_PORTFOLIO_WEIGHT: (C_PORTFOLIO_WEIGHT, "sum"),
+        }
     )
     common = grouped[grouped["覆盖ETF数"] > 1].sort_values(C_PORTFOLIO_WEIGHT, ascending=False)
     return pd.DataFrame(pair_rows), common.reset_index(drop=True)
@@ -391,8 +387,11 @@ def build_pcf_quality(detail: pd.DataFrame, etf_summary: pd.DataFrame) -> pd.Dat
                 "PCF来源": row.get(C_SOURCE, ""),
                 "股票权重合计%": stock_weight,
                 "现金及其他估算%": residual,
+                "PCF原始股票行数": row.get("PCF原始股票行数"),
+                "有效权重行数": row.get("有效权重行数", row.get("股票数")),
+                "未定价/缺失权重行数": row.get("未定价/缺失权重行数", 0),
                 "异常权重提示": "股票权重偏离100超过5%" if residual is not None and abs(residual) > 5 else "",
-                "异常成分行数": int(detail[detail[C_ETF_CODE].astype(str).eq(str(etf))][C_PORTFOLIO_WEIGHT].isna().sum()) if not detail.empty else 0,
+                "异常成分行数": int(to_float(row.get("未定价/缺失权重行数")) or 0),
                 "多XML候选文件对比": "SZSE parser 已按相关成分数量选择候选；候选明细未落表",
                 "PCF与季报持仓对比": "未计算；需要另取基金季报持仓",
             }
@@ -434,7 +433,9 @@ def build_constraint_checks(
 ) -> pd.DataFrame:
     df = add_classifications(detail)
     stock_group = (
-        df.groupby([C_STOCK_CODE, C_STOCK_NAME], as_index=False)[C_PORTFOLIO_WEIGHT].sum()
+        df.groupby([C_MARKET, C_STOCK_CODE], as_index=False).agg(
+            **{C_STOCK_NAME: (C_STOCK_NAME, "first"), C_PORTFOLIO_WEIGHT: (C_PORTFOLIO_WEIGHT, "sum")}
+        )
         if not df.empty
         else pd.DataFrame(columns=[C_STOCK_CODE, C_STOCK_NAME, C_PORTFOLIO_WEIGHT])
     )
@@ -444,9 +445,18 @@ def build_constraint_checks(
     row = portfolio_row.iloc[0] if not portfolio_row.empty else pd.Series(dtype=object)
     checks = []
 
-    def add(name: str, actual: float | None, operator: str, threshold: float | None, unit: str = "%") -> None:
+    def add(
+        name: str,
+        actual: float | None,
+        operator: str,
+        threshold: float | None,
+        unit: str = "%",
+        coverage: float | None = None,
+    ) -> None:
         if threshold is None:
             status = "未设置阈值"
+        elif coverage is not None and coverage < config.min_metric_coverage:
+            status = "数据不足"
         elif actual is None:
             status = "缺少数据"
         elif operator == "<=":
@@ -455,7 +465,7 @@ def build_constraint_checks(
             status = "通过" if actual >= threshold else "不通过"
         else:
             status = "未检查"
-        checks.append({"约束": name, "实际值": actual, "条件": "" if threshold is None else f"{operator} {threshold}", "单位": unit, "结果": status})
+        checks.append({"约束": name, "实际值": actual, "条件": "" if threshold is None else f"{operator} {threshold}", "单位": unit, "覆盖权重%": coverage, "结果": status})
 
     add("单一股票权重上限", float(stock_group[C_PORTFOLIO_WEIGHT].max()) if not stock_group.empty else None, "<=", config.max_stock_weight)
     max_industry = None
@@ -464,9 +474,9 @@ def build_constraint_checks(
         if not industry_rows.empty:
             max_industry = float(industry_rows["权重%"].max())
     add("单一行业权重上限", max_industry, "<=", config.max_industry_weight)
-    add("最低股息率", to_float(row.get("股息率%")), ">=", config.min_dividend_yield)
-    add("最高PE", to_float(row.get("PE")), "<=", config.max_pe, "倍")
-    add("最高PB", to_float(row.get("PB")), "<=", config.max_pb, "倍")
+    add("最低股息率", to_float(row.get("股息率%")), ">=", config.min_dividend_yield, coverage=to_float(row.get("股息率覆盖权重%")))
+    add("最高PE", to_float(row.get("PE")), "<=", config.max_pe, "倍", to_float(row.get("PE覆盖权重%")))
+    add("最高PB", to_float(row.get("PB")), "<=", config.max_pb, "倍", to_float(row.get("PB覆盖权重%")))
     add("最大回撤限制", to_float(row.get("最大回撤%")), ">=", config.max_drawdown)
     market_weights = df.groupby(C_MARKET)[C_PORTFOLIO_WEIGHT].sum().to_dict() if not df.empty else {}
     add("A股比例约束", to_float(market_weights.get("A")), ">=", config.target_a_weight)
@@ -478,19 +488,25 @@ def build_constraint_checks(
 
 
 def build_historical_tracking(detail: pd.DataFrame, cache_dir: Path, run_id: str, use_cache: bool) -> pd.DataFrame:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_path = cache_dir / f"holdings_{run_id}.csv"
+    portfolio_rows = (
+        detail[[C_ETF_CODE, C_ETF_WEIGHT]].drop_duplicates().sort_values(C_ETF_CODE).astype(str).values.tolist()
+        if not detail.empty and {C_ETF_CODE, C_ETF_WEIGHT}.issubset(detail.columns)
+        else []
+    )
+    signature = hashlib.sha256(json.dumps(portfolio_rows, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+    snapshot_path = cache_dir / f"holdings_{signature}_{run_id}.csv"
     if use_cache:
+        cache_dir.mkdir(parents=True, exist_ok=True)
         detail.to_csv(snapshot_path, index=False, encoding="utf-8-sig")
     rows = []
-    files = sorted(cache_dir.glob("holdings_*.csv"))
+    files = sorted(cache_dir.glob(f"holdings_{signature}_*.csv")) if cache_dir.exists() else []
     rows.append({"指标": "缓存快照数量", "数值": len(files), "说明": "用于后续历史穿透/持仓变化/换手率估算"})
     rows.append({"指标": "按每日PCF生成历史底层持仓", "数值": "已缓存当前快照" if use_cache else "未启用缓存", "说明": str(snapshot_path) if use_cache else ""})
     if len(files) >= 2:
         prev = pd.read_csv(files[-2], encoding="utf-8-sig")
         curr = detail
-        prev_map = prev.groupby(C_STOCK_CODE)[C_PORTFOLIO_WEIGHT].sum()
-        curr_map = curr.groupby(C_STOCK_CODE)[C_PORTFOLIO_WEIGHT].sum()
+        prev_map = prev.groupby([C_MARKET, C_STOCK_CODE])[C_PORTFOLIO_WEIGHT].sum()
+        curr_map = curr.groupby([C_MARKET, C_STOCK_CODE])[C_PORTFOLIO_WEIGHT].sum()
         all_codes = sorted(set(prev_map.index) | set(curr_map.index))
         turnover = sum(abs((curr_map.get(code, 0) or 0) - (prev_map.get(code, 0) or 0)) for code in all_codes) / 2
         rows.append({"指标": "持仓变化/换手率估算", "数值": turnover, "说明": f"对比 {files[-2].name} 与 {files[-1].name}"})

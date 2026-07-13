@@ -24,7 +24,9 @@ import pandas as pd
 
 from pcf_common import (
     annualized_return as common_annualized_return,
+    combine_price_series,
     earnings_yield_pe as common_earnings_yield_pe,
+    price_series_metrics,
     weighted_average as common_weighted_average,
 )
 from pcf_enhanced_analytics import (
@@ -125,6 +127,9 @@ C_RETURN_SOURCE = "\u6536\u76ca\u6765\u6e90"
 C_RETURN_WINDOW = "\u6536\u76ca\u533a\u95f4"
 C_RISK_WINDOW = "\u98ce\u9669\u6307\u6807\u533a\u95f4"
 C_RETURN_ERROR = "\u6536\u76ca\u9519\u8bef"
+C_RETURN_BASIS = "\u6536\u76ca\u53e3\u5f84"
+C_RETURN_CURRENCY = "\u6536\u76ca\u5e01\u79cd"
+C_PORTFOLIO_METHOD = "\u7ec4\u5408\u6784\u9020"
 C_MAX_DRAWDOWN = "\u6700\u5927\u56de\u64a4%"
 C_SHARPE = "Sharpe Ratio"
 C_CALMAR = "Calmar Ratio"
@@ -136,6 +141,11 @@ C_PE_COVERAGE = "\u0050\u0045\u8986\u76d6\u6743\u91cd%"
 C_DY_COVERAGE = "\u80a1\u606f\u7387\u8986\u76d6\u6743\u91cd%"
 C_PB_COVERAGE = "\u0050\u0042\u8986\u76d6\u6743\u91cd%"
 C_NEGATIVE_PE_WEIGHT = "\u8d1f\u0050\u0045\u6743\u91cd%"
+C_ERROR = "\u9519\u8bef"
+C_LOOKTHROUGH_BASIS = "\u7a7f\u900f\u53e3\u5f84"
+C_RAW_STOCK_ROWS = "PCF\u539f\u59cb\u80a1\u7968\u884c\u6570"
+C_EFFECTIVE_STOCK_ROWS = "\u6709\u6548\u6743\u91cd\u884c\u6570"
+C_MISSING_WEIGHT_ROWS = "\u672a\u5b9a\u4ef7/\u7f3a\u5931\u6743\u91cd\u884c\u6570"
 
 
 @dataclass(frozen=True)
@@ -286,6 +296,8 @@ def get_a_stock_holdings(a_module: Any, etf: str) -> tuple[pd.DataFrame, dict[st
     holdings, period, source = retry(lambda: a_module.get_pcf_holdings(etf, {}))
     stock_mask = holdings[C_MARKET].isin(a_module.A_MARKETS) & holdings[C_STOCK_CODE].astype(str).map(a_module.is_a_stock_code)
     holdings = fill_missing_a_weights(a_module, holdings, stock_mask)
+    raw_stock_rows = int(stock_mask.sum())
+    missing_weight_rows = int(pd.to_numeric(holdings.loc[stock_mask, C_A_WEIGHT], errors="coerce").isna().sum())
     if C_PRICE not in holdings.columns:
         holdings[C_PRICE] = None
     result = holdings.loc[stock_mask, [C_STOCK_CODE, C_STOCK_NAME, C_MARKET, C_A_WEIGHT, C_PRICE, C_WEIGHT_SOURCE]].copy()
@@ -300,6 +312,9 @@ def get_a_stock_holdings(a_module: Any, etf: str) -> tuple[pd.DataFrame, dict[st
         C_SOURCE: source,
         C_MODE: "a",
         C_STOCK_COUNT: int(len(result)),
+        C_RAW_STOCK_ROWS: raw_stock_rows,
+        C_EFFECTIVE_STOCK_ROWS: int(len(result)),
+        C_MISSING_WEIGHT_ROWS: missing_weight_rows,
         "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%": float(result[C_ETF_INNER_WEIGHT].sum()),
     }
     return result, meta
@@ -308,6 +323,8 @@ def get_a_stock_holdings(a_module: Any, etf: str) -> tuple[pd.DataFrame, dict[st
 def get_hk_stock_holdings(hk_module: Any, etf: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     holdings, period = retry(lambda: hk_module.get_pcf_holdings(etf))
     stock_mask = holdings[C_STOCK_CODE].astype(str).str.strip().str.fullmatch(r"\d{1,5}")
+    raw_stock_rows = int(stock_mask.sum())
+    missing_weight_rows = int(pd.to_numeric(holdings.loc[stock_mask, C_HK_WEIGHT], errors="coerce").isna().sum())
     result = holdings.loc[stock_mask, [C_STOCK_CODE, C_STOCK_NAME, C_HK_WEIGHT]].copy()
     result[C_STOCK_CODE] = result[C_STOCK_CODE].astype(str).map(lambda value: re.sub(r"\D", "", value).zfill(5))
     result[C_MARKET] = "HK"
@@ -321,6 +338,9 @@ def get_hk_stock_holdings(hk_module: Any, etf: str) -> tuple[pd.DataFrame, dict[
         C_SOURCE: "pcf_lookthrough",
         C_MODE: "hk",
         C_STOCK_COUNT: int(len(result)),
+        C_RAW_STOCK_ROWS: raw_stock_rows,
+        C_EFFECTIVE_STOCK_ROWS: int(len(result)),
+        C_MISSING_WEIGHT_ROWS: missing_weight_rows,
         "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%": float(result[C_ETF_INNER_WEIGHT].sum()),
     }
     return result, meta
@@ -334,7 +354,10 @@ def get_us_stock_holdings(us_module: Any, etf: str) -> tuple[pd.DataFrame, dict[
     for column in needed + [C_DETAIL_SOURCE, C_VALUATION_ERROR]:
         if column not in holdings.columns:
             holdings[column] = None
-    result = holdings.loc[holdings[C_MARKET].eq("US"), needed + [C_DETAIL_SOURCE, C_VALUATION_ERROR]].copy()
+    stock_mask = holdings[C_MARKET].eq("US")
+    raw_stock_rows = int(stock_mask.sum())
+    missing_weight_rows = int(pd.to_numeric(holdings.loc[stock_mask, C_A_WEIGHT], errors="coerce").isna().sum())
+    result = holdings.loc[stock_mask, needed + [C_DETAIL_SOURCE, C_VALUATION_ERROR]].copy()
     result[C_STOCK_CODE] = result[C_STOCK_CODE].astype(str).map(us_module.normalize_us_ticker)
     result[C_MARKET] = "US"
     result.rename(columns={C_A_WEIGHT: C_ETF_INNER_WEIGHT}, inplace=True)
@@ -348,6 +371,9 @@ def get_us_stock_holdings(us_module: Any, etf: str) -> tuple[pd.DataFrame, dict[
         C_SOURCE: source,
         C_MODE: "us",
         C_STOCK_COUNT: int(len(result)),
+        C_RAW_STOCK_ROWS: raw_stock_rows,
+        C_EFFECTIVE_STOCK_ROWS: int(len(result)),
+        C_MISSING_WEIGHT_ROWS: missing_weight_rows,
         "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%": float(result[C_ETF_INNER_WEIGHT].sum()),
     }
     return result, meta
@@ -376,6 +402,9 @@ def get_us_listed_stock_holdings(us_listed_module: Any, etf: str) -> tuple[pd.Da
         C_SOURCE: row.get(us_listed_module.C_SOURCE, "us_listed"),
         C_MODE: "us_listed",
         C_STOCK_COUNT: int(len(result)),
+        C_RAW_STOCK_ROWS: int(len(detail)),
+        C_EFFECTIVE_STOCK_ROWS: int(len(result)),
+        C_MISSING_WEIGHT_ROWS: int(pd.to_numeric(detail[us_listed_module.C_INNER_WEIGHT], errors="coerce").isna().sum()),
         "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%": float(result[C_ETF_INNER_WEIGHT].sum()),
         C_ETF_NAME: row.get(us_listed_module.C_ETF_NAME, ticker),
     }
@@ -539,15 +568,15 @@ def fetch_etf_price_series(ak_module: Any, etf: str, lookback_days: int) -> tupl
 
     try:
         price = retry(
-            lambda: ak_module.fund_etf_hist_em(symbol=etf, period="daily", start_date=start, end_date=end, adjust=""),
+            lambda: ak_module.fund_etf_hist_em(symbol=etf, period="daily", start_date=start, end_date=end, adjust="qfq"),
             tries=2,
         )
         series = normalize_price_series(price, best_column(price, ["\u65e5\u671f"], 0), best_column(price, ["\u6536\u76d8"], 2))
         if len(series) >= 30:
-            return series, "eastmoney_price"
-        errors.append(f"eastmoney_price: {len(series)} observations")
+            return series, "eastmoney_price_qfq"
+        errors.append(f"eastmoney_price_qfq: {len(series)} observations")
     except Exception as exc:  # noqa: BLE001
-        errors.append(f"eastmoney_price: {exc}")
+        errors.append(f"eastmoney_price_qfq: {exc}")
 
     try:
         sina = retry(lambda: ak_module.fund_etf_hist_sina(symbol=etf_exchange_symbol(etf)), tries=2)
@@ -597,72 +626,29 @@ def trailing_return(series: pd.Series, days_back: int, min_days: int) -> float |
 
 
 def summarize_price_series(series: pd.Series, source: str) -> dict[str, Any]:
-    series = series.dropna().sort_index()
-    if len(series) < 2:
-        return {C_RETURN_SOURCE: source, C_RETURN_ERROR: "not enough observations"}
-
-    one_year = value_window(series, days_back=365, min_days=330)
-    returns = series.pct_change().dropna()
-    last_ts = series.index[-1]
-    one_year_returns = returns[returns.index >= last_ts - pd.Timedelta(days=365)]
-    sample = one_year_returns if len(one_year_returns) >= 60 else returns
-    volatility = None
-    sortino = None
-    sharpe = None
-    calmar = None
-    var_95 = None
-    cvar_95 = None
-    downside_vol = None
-    annual_return = None
-    risk_window = ""
-    max_drawdown = None
-    if len(series) >= 2:
-        drawdown = series.div(series.cummax()).sub(1.0)
-        max_drawdown_fraction = float(drawdown.min())
-        max_drawdown = max_drawdown_fraction * 100
-    else:
-        max_drawdown_fraction = None
-    if len(sample) >= 2:
-        volatility_fraction = float(sample.std(ddof=1)) * math.sqrt(252)
-        volatility = volatility_fraction * 100
-        downside = sample[sample < 0]
-        downside_dev = float((downside.pow(2).mean()) ** 0.5) if not downside.empty else None
-        mean_daily = float(sample.mean())
-        annual_return = (1 + mean_daily) ** 252 - 1 if mean_daily > -1 else None
-        if annual_return is not None and volatility_fraction > 0:
-            sharpe = annual_return / volatility_fraction
-        if annual_return is not None and max_drawdown_fraction is not None and max_drawdown_fraction < 0:
-            calmar = annual_return / abs(max_drawdown_fraction)
-        if annual_return is not None and downside_dev and downside_dev > 0:
-            sortino = annual_return / (downside_dev * math.sqrt(252))
-            downside_vol = downside_dev * math.sqrt(252) * 100
-        var_threshold = float(sample.quantile(0.05))
-        var_95 = var_threshold * 100
-        tail = sample[sample <= var_threshold]
-        cvar_95 = None if tail.empty else float(tail.mean()) * 100
-        risk_window = f"{sample.index[0].date()} to {sample.index[-1].date()}"
-
+    metrics = price_series_metrics(series)
+    if metrics.get("error"):
+        return {C_RETURN_SOURCE: source, C_RETURN_ERROR: metrics["error"]}
+    adjusted = "nav" in source or "qfq" in source or "adjusted" in source
     return {
-        C_ANNUAL_RETURN: None
-        if one_year.get("error") or one_year.get("short_window")
-        else one_year.get("annualized_return_pct"),
-        C_SORTINO: sortino,
-        C_VOLATILITY: volatility,
-        C_HALF_YEAR_RETURN: trailing_return(series, days_back=183, min_days=150),
-        C_ONE_YEAR_RETURN: trailing_return(series, days_back=365, min_days=330),
-        C_THREE_YEAR_RETURN: trailing_return(series, days_back=365 * 3, min_days=900),
-        C_MAX_DRAWDOWN: max_drawdown,
-        C_SHARPE: sharpe,
-        C_CALMAR: calmar,
+        C_ANNUAL_RETURN: metrics["annualized_return_pct"],
+        C_SORTINO: metrics["sortino_ratio"],
+        C_VOLATILITY: metrics["volatility_pct"],
+        C_HALF_YEAR_RETURN: metrics["half_year_return_pct"],
+        C_ONE_YEAR_RETURN: metrics["one_year_return_pct"],
+        C_THREE_YEAR_RETURN: metrics["three_year_return_pct"],
+        C_MAX_DRAWDOWN: metrics["max_drawdown_pct"],
+        C_SHARPE: metrics["sharpe_ratio"],
+        C_CALMAR: metrics["calmar_ratio"],
         C_BETA: None,
-        C_VAR_95: var_95,
-        C_CVAR_95: cvar_95,
-        C_DOWNSIDE_VOL: downside_vol,
+        C_VAR_95: metrics["var95_pct"],
+        C_CVAR_95: metrics["cvar95_pct"],
+        C_DOWNSIDE_VOL: metrics["downside_volatility_pct"],
         C_RETURN_SOURCE: source,
-        C_RETURN_WINDOW: ""
-        if one_year.get("error")
-        else f"{one_year.get('first_date')} to {one_year.get('last_date')}",
-        C_RISK_WINDOW: risk_window,
+        C_RETURN_BASIS: "\u603b\u6536\u76ca/\u590d\u6743" if adjusted else "\u4ef7\u683c\u6536\u76ca(\u672a\u8ba1\u73b0\u91d1\u5206\u7ea2)",
+        C_RETURN_CURRENCY: "CNY",
+        C_RETURN_WINDOW: metrics["return_window"],
+        C_RISK_WINDOW: metrics["risk_window"],
     }
 
 
@@ -674,7 +660,13 @@ def selected_price_series(selected: SelectedETF, ak_module: Any, us_listed_modul
         series, source = us_listed_module.price_series(ticker, lookback_days, cache_dir=None)
         if len(series) < 30:
             raise RuntimeError(f"{source}: {len(series)} observations")
-        return series, source
+        if not hasattr(us_listed_module, "fx_series"):
+            raise RuntimeError("US-listed ETF return conversion requires USD/CNY history")
+        fx, fx_source = us_listed_module.fx_series(lookback_days, cache_dir=None)
+        aligned = pd.concat([series.rename("etf"), fx.rename("fx")], axis=1, sort=True).sort_index().ffill().dropna()
+        if len(aligned) < 30:
+            raise RuntimeError("USD/CNY-aligned return series is too short")
+        return aligned["etf"] * aligned["fx"], f"{source}*{fx_source}"
     return fetch_etf_price_series(ak_module, selected.code, lookback_days=lookback_days)
 
 
@@ -700,14 +692,13 @@ def portfolio_return_metrics(selections: list[SelectedETF], ak_module: Any, us_l
     if not series_map:
         return {C_RETURN_SOURCE: "weighted_etf_nav_or_price", C_RETURN_ERROR: "no ETF return series"}
 
-    price_df = pd.concat(series_map.values(), axis=1, sort=True).sort_index().ffill().dropna()
-    if price_df.empty or len(price_df) < 2:
+    portfolio = combine_price_series(series_map, weight_by_code)
+    if portfolio.empty or len(portfolio) < 2:
         return {C_RETURN_SOURCE: "weighted_etf_nav_or_price", C_RETURN_ERROR: "not enough aligned observations"}
-    normalized = price_df.div(price_df.iloc[0])
-    portfolio = sum(normalized[code] * weight_by_code[code] for code in weight_by_code)
     metrics = summarize_price_series(portfolio, "weighted_etf_nav_or_price")
     detail = ",".join(f"{code}:{source_map[code]}" for code in weight_by_code)
     metrics[C_RETURN_SOURCE] = f"weighted_etf_nav_or_price({detail})"
+    metrics[C_PORTFOLIO_METHOD] = "\u521d\u59cb\u6743\u91cd\u4e70\u5165\u5e76\u6301\u6709"
     return metrics
 
 
@@ -768,7 +759,9 @@ def enrich_detail_stock_metrics(
     hk_detail = detail[detail[C_UNDERLYING_MARKET].eq("HK")]
     if not hk_detail.empty:
         hk_rows: list[dict[str, Any]] = []
-        grouped = hk_detail.groupby([C_STOCK_CODE, C_STOCK_NAME], dropna=False, as_index=False)[C_PORTFOLIO_WEIGHT].sum()
+        grouped = hk_detail.groupby(C_STOCK_CODE, dropna=False, as_index=False).agg(
+            **{C_STOCK_NAME: (C_STOCK_NAME, "first"), C_PORTFOLIO_WEIGHT: (C_PORTFOLIO_WEIGHT, "sum")}
+        )
         for _, row in grouped.iterrows():
             hk_rows.append(
                 {
@@ -861,7 +854,23 @@ def build_tables(
     etf_rows: list[dict[str, Any]] = []
     for selected in selections:
         print(f"Reading latest PCF for ETF {selected.code} mode={selected.mode}...")
-        holdings, meta = resolve_holdings(selected, a_module, hk_module, us_module, min_auto_weight, us_listed_module)
+        try:
+            holdings, meta = resolve_holdings(selected, a_module, hk_module, us_module, min_auto_weight, us_listed_module)
+        except Exception as exc:  # noqa: BLE001 - retain failed ETF in portfolio audit output
+            etf_rows.append(
+                {
+                    C_ETF_CODE: selected.code,
+                    C_ETF_NAME: name_map.get(selected.code, ""),
+                    C_ETF_WEIGHT: selected.weight * 100,
+                    C_MODE: selected.mode,
+                    C_STOCK_COUNT: 0,
+                    C_RAW_STOCK_ROWS: 0,
+                    C_EFFECTIVE_STOCK_ROWS: 0,
+                    C_MISSING_WEIGHT_ROWS: 0,
+                    C_ERROR: str(exc),
+                }
+            )
+            continue
         etf_name = name_map.get(selected.code, "") or str(meta.get(C_ETF_NAME) or "")
         for _, row in holdings.iterrows():
             etf_weight_pct = selected.weight * 100
@@ -893,7 +902,16 @@ def build_tables(
                 C_MODE: meta[C_MODE],
                 C_PERIOD: meta[C_PERIOD],
                 C_SOURCE: meta[C_SOURCE],
+                C_LOOKTHROUGH_BASIS: (
+                    "SEC N-PORT/\u53d1\u884c\u5546\u62a5\u544a\u6301\u4ed3"
+                    if meta[C_MODE] == "us_listed"
+                    else ("\u57fa\u91d1\u5b63\u62a5\u6301\u4ed3" if "reported" in str(meta[C_SOURCE]).lower() else "PCF\u7533\u8d4e\u7bee\u5b50\u4f30\u7b97")
+                ),
                 C_STOCK_COUNT: meta[C_STOCK_COUNT],
+                C_RAW_STOCK_ROWS: meta.get(C_RAW_STOCK_ROWS, meta[C_STOCK_COUNT]),
+                C_EFFECTIVE_STOCK_ROWS: meta.get(C_EFFECTIVE_STOCK_ROWS, meta[C_STOCK_COUNT]),
+                C_MISSING_WEIGHT_ROWS: meta.get(C_MISSING_WEIGHT_ROWS, 0),
+                C_ERROR: "",
                 "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%": meta[
                     "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%"
                 ],
@@ -902,6 +920,9 @@ def build_tables(
 
     detail = pd.DataFrame(detail_rows)
     etf_summary = pd.DataFrame(etf_rows)
+    if detail.empty:
+        failures = "; ".join(f"{row.get(C_ETF_CODE)}: {row.get(C_ERROR)}" for row in etf_rows)
+        raise RuntimeError(f"No selected ETF holdings completed. {failures}")
     summary = (
         detail.groupby([C_UNDERLYING_MARKET, C_STOCK_CODE], as_index=False)
         .agg(
@@ -1002,7 +1023,12 @@ def add_metrics_to_tables(
         etf_detail = detail[detail[C_ETF_CODE].astype(str).str.zfill(6).eq(etf)]
         valuation = aggregate_valuation_rows(valuation_rows_from_detail(etf_detail, C_ETF_INNER_WEIGHT))
         mode = str(etf_row.get(C_MODE) or "")
-        returns = safe_selected_return_metrics(SelectedETF(etf, 1.0, mode), ak_module, us_listed_module, lookback_days=lookback_days)
+        holding_error = str(etf_row.get(C_ERROR) or "")
+        returns = (
+            {C_RETURN_SOURCE: "", C_RETURN_ERROR: holding_error}
+            if holding_error
+            else safe_selected_return_metrics(SelectedETF(etf, 1.0, mode), ak_module, us_listed_module, lookback_days=lookback_days)
+        )
         for key, value in {**valuation, **returns}.items():
             etf_summary.at[idx, key] = value
         metric_rows.append(
@@ -1014,7 +1040,9 @@ def add_metrics_to_tables(
                 C_MODE: etf_row.get(C_MODE),
                 C_PERIOD: etf_row.get(C_PERIOD),
                 C_SOURCE: etf_row.get(C_SOURCE),
+                C_LOOKTHROUGH_BASIS: etf_row.get(C_LOOKTHROUGH_BASIS),
                 C_STOCK_COUNT: etf_row.get(C_STOCK_COUNT),
+                C_ERROR: holding_error,
                 **valuation,
                 **returns,
             }
@@ -1045,6 +1073,7 @@ def add_metrics_to_tables(
         C_MODE,
         C_PERIOD,
         C_SOURCE,
+        C_LOOKTHROUGH_BASIS,
         C_STOCK_COUNT,
         C_HOLDING_WEIGHT_TOTAL,
         C_DIVIDEND_YIELD,
@@ -1067,10 +1096,14 @@ def add_metrics_to_tables(
         C_RETURN_WINDOW,
         C_RISK_WINDOW,
         C_RETURN_ERROR,
+        C_RETURN_BASIS,
+        C_RETURN_CURRENCY,
+        C_PORTFOLIO_METHOD,
         C_PE_COVERAGE,
         C_DY_COVERAGE,
         C_PB_COVERAGE,
         C_NEGATIVE_PE_WEIGHT,
+        C_ERROR,
     ]
     for column in preferred_cols:
         if column not in metrics_summary.columns:
@@ -1090,6 +1123,7 @@ def constraint_config_from_args(args: argparse.Namespace) -> ConstraintConfig:
         target_a_weight=getattr(args, "target_a_weight", None),
         target_hk_weight=getattr(args, "target_hk_weight", None),
         target_us_weight=getattr(args, "target_us_weight", None),
+        min_metric_coverage=getattr(args, "min_metric_coverage", 80.0),
     )
 
 
@@ -1128,10 +1162,11 @@ def write_outputs(
         constraints=constraint_config_from_args(args),
         use_cache=getattr(args, "use_cache", True),
     )
-    for key, filename in ENHANCED_CSV_OUTPUTS.items():
-        df = enhanced_outputs.get(key)
-        if df is not None:
-            df.to_csv(out_dir / filename, index=False, encoding="utf-8-sig")
+    if args.full_output:
+        for key, filename in ENHANCED_CSV_OUTPUTS.items():
+            df = enhanced_outputs.get(key)
+            if df is not None:
+                df.to_csv(out_dir / filename, index=False, encoding="utf-8-sig")
     report_outputs = {
         "summary": summary,
         "detail": detail,
@@ -1139,8 +1174,9 @@ def write_outputs(
         "metrics_summary": metrics_summary,
         **enhanced_outputs,
     }
-    (out_dir / OUT_MARKDOWN).write_text(build_markdown_report(report_outputs), encoding="utf-8")
-    (out_dir / OUT_HTML).write_text(build_html_report(report_outputs), encoding="utf-8")
+    if args.full_output:
+        (out_dir / OUT_MARKDOWN).write_text(build_markdown_report(report_outputs), encoding="utf-8")
+        (out_dir / OUT_HTML).write_text(build_html_report(report_outputs), encoding="utf-8")
     run_summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "etfs": args.etf,
@@ -1157,7 +1193,8 @@ def write_outputs(
         "max_single_stock_exposure_pct": None if summary.empty else float(summary["\u7ec4\u5408\u7a7f\u900f\u6743\u91cd%"].max()),
         "pcf_periods": sorted(str(x) for x in detail[C_PERIOD].dropna().unique()) if not detail.empty else [],
     }
-    (out_dir / OUT_JSON).write_text(json.dumps(run_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.full_output:
+        (out_dir / OUT_JSON).write_text(json.dumps(run_summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     with pd.ExcelWriter(out_dir / OUT_XLSX, engine="openpyxl") as writer:
         summary.to_excel(writer, index=False, sheet_name="\u7a7f\u900f\u6c47\u603b")
@@ -1194,6 +1231,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional per-ETF modes: auto, hk, a, us, us_listed. One value applies to all; or provide one per ETF. Default: auto.",
     )
     parser.add_argument("--out-dir", default="selected_etf_lookthrough_output", help="Output directory.")
+    parser.add_argument("--full-output", action="store_true", help="Write auxiliary CSV, Markdown, HTML, and run_summary files.")
     parser.add_argument("--a-script", default=str(DEFAULT_A_SCRIPT), help="Path to A-share PCF helper script.")
     parser.add_argument("--hk-script", default=str(DEFAULT_HK_SCRIPT), help="Path to HK PCF helper script.")
     parser.add_argument("--us-script", default=str(DEFAULT_US_SCRIPT), help="Path to US-stock PCF helper script.")
@@ -1216,8 +1254,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--risk", action="store_true", help="Generate risk analysis outputs. Included by default.")
     parser.add_argument("--html-report", action="store_true", help="Write enhanced_report.html. Included by default.")
     cache_group = parser.add_mutually_exclusive_group()
-    cache_group.add_argument("--cache", dest="use_cache", action="store_true", default=True, help="Cache the current look-through holdings snapshot. Default.")
-    cache_group.add_argument("--no-cache", dest="use_cache", action="store_false", help="Do not write a holdings snapshot under output cache.")
+    cache_group.add_argument("--cache", dest="use_cache", action="store_true", default=False, help="Cache the current look-through holdings snapshot.")
+    cache_group.add_argument("--no-cache", dest="use_cache", action="store_false", help="Do not write a holdings snapshot under output cache. Default.")
     parser.add_argument("--refresh-cache", action="store_true", help="Remove existing holdings snapshots in the output cache before this run.")
     parser.add_argument("--max-stock-weight", type=float, help="Constraint check: max allowed single-stock look-through weight percent.")
     parser.add_argument("--max-industry-weight", type=float, help="Constraint check: max allowed rule-industry look-through weight percent.")
@@ -1228,12 +1266,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-a-weight", type=float, help="Constraint check: minimum A-share look-through weight percent.")
     parser.add_argument("--target-hk-weight", type=float, help="Constraint check: minimum Hong Kong look-through weight percent.")
     parser.add_argument("--target-us-weight", type=float, help="Constraint check: minimum US-stock look-through weight percent.")
+    parser.add_argument("--min-metric-coverage", type=float, default=80.0, help="Minimum PE/PB/dividend coverage required before a valuation constraint can pass.")
     return parser
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    args.full_output = args.full_output or any(
+        (args.compare, args.industry, args.theme, args.risk, args.html_report)
+    )
     selections = selected_etfs(args.etf, args.weights, args.markets)
     a_module = import_module(Path(args.a_script), "selected_etf_a_pcf")
     hk_module = import_module(Path(args.hk_script), "selected_etf_hk_pcf")
@@ -1249,7 +1291,7 @@ def main() -> int:
         name_map=name_map,
         min_auto_weight=args.min_auto_weight,
     )
-    metrics_summary = pd.DataFrame()
+    metrics_summary = pd.DataFrame(columns=[C_TYPE, C_ETF_CODE])
     if not args.skip_metrics:
         summary, detail, etf_summary, metrics_summary = add_metrics_to_tables(
             selections,
@@ -1272,8 +1314,9 @@ def main() -> int:
     print(f"Saved: {out_dir / OUT_ETF_SUMMARY}")
     print(f"Saved: {out_dir / OUT_METRICS}")
     print(f"Saved: {out_dir / OUT_XLSX}")
-    print(f"Saved: {out_dir / OUT_MARKDOWN}")
-    print(f"Saved: {out_dir / OUT_HTML}")
+    if args.full_output:
+        print(f"Saved: {out_dir / OUT_MARKDOWN}")
+        print(f"Saved: {out_dir / OUT_HTML}")
     print(f"Saved: {out_dir / 'run_manifest.json'}")
     if not summary.empty:
         print("\nTop look-through holdings:")

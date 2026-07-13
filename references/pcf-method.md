@@ -10,6 +10,8 @@ Use the method below when maintaining or debugging the bundled scripts.
    - `pcf_full_metrics_table.xlsx`
    - `pcf_full_metrics_table.csv`
 
+PCF is a creation/redemption basket estimate, not a guarantee of the fund's exact accounting holdings. Preserve `穿透口径`, raw component count, usable component count, unresolved component count, source date, and residual cash/other weight.
+
 ## Trading date awareness
 
 - PCF files are exchange-published basket files and may reflect the latest available trading day, not necessarily the calendar date when the script is run.
@@ -53,5 +55,7 @@ Sort final rows by look-through dividend yield descending. Include:
 - HK holding weight and holdings source for quality control
 
 Leave three-year return blank when the available price/NAV history is too short; do not annualize a short window and label it as three-year performance.
+
+Do not rank rows whose dividend-yield coverage is below 80% by default. Keep them in the final table with `数据状态=覆盖不足`.
 
 For column definitions and null semantics, read `output-schema.md`.

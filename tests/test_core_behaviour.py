@@ -40,6 +40,7 @@ class CoreBehaviourTests(unittest.TestCase):
         cls.selected = import_script("test_selected", "scripts/selected_etf_lookthrough.py")
         cls.enhanced = import_script("test_enhanced", "scripts/pcf_enhanced_analytics.py")
         cls.runner = import_script("test_runner", "scripts/run_pcf_metrics.py")
+        cls.common = import_script("test_common", "scripts/pcf_common.py")
 
     def test_load_a_stock_snapshot_does_not_recurse(self) -> None:
         frame = pd.DataFrame(
@@ -172,15 +173,18 @@ class CoreBehaviourTests(unittest.TestCase):
             keep_csv = out_dir / self.runner.FINAL_CSV
             keep_xlsx = out_dir / self.runner.FINAL_XLSX
             remove_json = out_dir / "513690_lookthrough.json"
+            user_file = out_dir / "user_notes.txt"
             keep_csv.write_text("csv", encoding="utf-8")
             keep_xlsx.write_text("xlsx", encoding="utf-8")
             remove_json.write_text("json", encoding="utf-8")
+            user_file.write_text("keep", encoding="utf-8")
 
             self.runner.clean_intermediates(out_dir)
 
             self.assertTrue(keep_csv.exists())
             self.assertTrue(keep_xlsx.exists())
             self.assertFalse(remove_json.exists())
+            self.assertTrue(user_file.exists())
 
     def test_us_ticker_normalization_preserves_ticker_shape(self) -> None:
         self.assertEqual(self.us_metrics.normalize_us_ticker(" brk.b "), "BRK.B")
@@ -266,6 +270,7 @@ class CoreBehaviourTests(unittest.TestCase):
         us_listed = types.SimpleNamespace(
             normalize_us_ticker=lambda value: str(value).upper().replace(".US", ""),
             price_series=lambda ticker, lookback_days, cache_dir=None: (pd.Series(range(100, 140), index=dates, dtype=float), f"fixture_{ticker}"),
+            fx_series=lambda lookback_days, cache_dir=None: (pd.Series(1.0, index=dates, dtype=float), "fixture_fx"),
         )
 
         metrics = self.selected.portfolio_return_metrics(
@@ -277,6 +282,61 @@ class CoreBehaviourTests(unittest.TestCase):
 
         self.assertIn("fixture_QQQ", metrics[self.selected.C_RETURN_SOURCE])
         self.assertNotIn(self.selected.C_RETURN_ERROR, metrics)
+
+    def test_stock_constraint_merges_same_market_code_with_different_names(self) -> None:
+        detail = pd.DataFrame(
+            [
+                {self.enhanced.C_ETF_CODE: "A", self.enhanced.C_MARKET: "US", self.enhanced.C_STOCK_CODE: "NVDA", self.enhanced.C_STOCK_NAME: "NVIDIA CORP", self.enhanced.C_ETF_INNER_WEIGHT: 4.0, self.enhanced.C_PORTFOLIO_WEIGHT: 4.0},
+                {self.enhanced.C_ETF_CODE: "B", self.enhanced.C_MARKET: "US", self.enhanced.C_STOCK_CODE: "NVDA", self.enhanced.C_STOCK_NAME: "NVIDIA Corporation", self.enhanced.C_ETF_INNER_WEIGHT: 4.0, self.enhanced.C_PORTFOLIO_WEIGHT: 4.0},
+            ]
+        )
+        checks = self.enhanced.build_constraint_checks(
+            detail,
+            pd.DataFrame([{self.enhanced.C_ETF_CODE: "PORTFOLIO"}]),
+            pd.DataFrame(),
+            self.enhanced.ConstraintConfig(max_stock_weight=7),
+        )
+        row = checks[checks["约束"].eq("单一股票权重上限")].iloc[0]
+        self.assertAlmostEqual(row["实际值"], 8.0)
+        self.assertEqual(row["结果"], "不通过")
+
+    def test_valuation_constraint_requires_minimum_coverage(self) -> None:
+        detail = pd.DataFrame(
+            [{self.enhanced.C_ETF_CODE: "A", self.enhanced.C_MARKET: "US", self.enhanced.C_STOCK_CODE: "X", self.enhanced.C_STOCK_NAME: "X", self.enhanced.C_ETF_INNER_WEIGHT: 5.0, self.enhanced.C_PORTFOLIO_WEIGHT: 5.0}]
+        )
+        metrics = pd.DataFrame([{self.enhanced.C_ETF_CODE: "PORTFOLIO", "PE": 8.0, "PE覆盖权重%": 5.0}])
+        checks = self.enhanced.build_constraint_checks(detail, metrics, pd.DataFrame(), self.enhanced.ConstraintConfig(max_pe=10))
+        row = checks[checks["约束"].eq("最高PE")].iloc[0]
+        self.assertEqual(row["结果"], "数据不足")
+
+    def test_shared_return_metrics_reject_short_named_windows(self) -> None:
+        dates = pd.date_range("2026-01-01", periods=40, freq="D")
+        metrics = self.common.price_series_metrics(pd.Series(range(100, 140), index=dates, dtype=float))
+        self.assertIsNone(metrics["half_year_return_pct"])
+        self.assertIsNone(metrics["one_year_return_pct"])
+        self.assertIsNone(metrics["three_year_return_pct"])
+
+    def test_batch_failure_rows_are_retained(self) -> None:
+        report = pd.DataFrame([{"ETF代码": "513690", "数据状态": "有效", "错误": ""}])
+        result = self.runner.append_failed_rows(report, ["513690", "159569"], {"159569": "fixture failure"})
+        failed = result[result["ETF代码"].eq("159569")].iloc[0]
+        self.assertEqual(failed["数据状态"], "失败")
+        self.assertEqual(failed["错误"], "fixture failure")
+
+    def test_pcf_quality_uses_pre_filter_missing_row_count(self) -> None:
+        detail = pd.DataFrame(
+            [{self.enhanced.C_ETF_CODE: "A", self.enhanced.C_MARKET: "US", self.enhanced.C_STOCK_CODE: "X", self.enhanced.C_STOCK_NAME: "X", self.enhanced.C_PORTFOLIO_WEIGHT: 90.0}]
+        )
+        etf_summary = pd.DataFrame(
+            [{self.enhanced.C_ETF_CODE: "A", "ETF内股票权重合计%": 90.0, "PCF原始股票行数": 11, "有效权重行数": 10, "未定价/缺失权重行数": 1}]
+        )
+        quality = self.enhanced.build_pcf_quality(detail, etf_summary)
+        self.assertEqual(quality.iloc[0]["异常成分行数"], 1)
+
+    def test_selected_default_output_is_compact(self) -> None:
+        args = self.selected.build_parser().parse_args(["--etf", "510880"])
+        self.assertFalse(args.full_output)
+        self.assertFalse(args.use_cache)
 
     def test_us_metrics_prefer_us_listed_helper_when_available(self) -> None:
         detail = pd.DataFrame(

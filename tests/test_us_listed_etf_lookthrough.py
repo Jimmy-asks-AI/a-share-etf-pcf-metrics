@@ -95,6 +95,13 @@ class USListedETFTests(unittest.TestCase):
         self.assertIn(self.mod.C_PE, enriched.columns)
         self.assertTrue(pd.isna(enriched.iloc[0][self.mod.C_PE]))
 
+    def test_short_history_does_not_masquerade_as_long_windows(self) -> None:
+        dates = pd.date_range("2026-01-01", periods=40, freq="D")
+        metrics = self.mod.return_metrics(pd.Series(range(100, 140), index=dates, dtype=float))
+        self.assertIsNone(metrics["近半年收益%"])
+        self.assertIsNone(metrics["近一年收益%"])
+        self.assertIsNone(metrics["近3年收益%"])
+
     def test_yahoo_raw_number_and_compact_outputs(self) -> None:
         self.assertAlmostEqual(self.mod.raw_number({"raw": 12.34, "fmt": "12.34"}), 12.34)
         compact = self.mod.output_files(False)
@@ -131,6 +138,29 @@ class USListedETFTests(unittest.TestCase):
             self.mod.request_text = old_request_text
 
         self.assertEqual(filing[1], "0001-26-000002")
+
+    def test_resolve_security_ticker_uses_cusip_search(self) -> None:
+        old_request_json = self.mod.request_json
+        old_openfigi = self.mod.openfigi_ticker
+        self.mod.YAHOO_SEARCH_CACHE.clear()
+        try:
+            self.mod.openfigi_ticker = lambda cusip: ""
+            self.mod.request_json = lambda *args, **kwargs: {"quotes": [{"symbol": "META.MI", "quoteType": "EQUITY", "exchange": "MIL"}, {"symbol": "META", "quoteType": "EQUITY", "exchange": "NMS"}]}
+            ticker = self.mod.resolve_security_ticker("Meta Platforms, Inc., Class A", "30303M102", {})
+        finally:
+            self.mod.request_json = old_request_json
+            self.mod.openfigi_ticker = old_openfigi
+        self.assertEqual(ticker, "META")
+
+    def test_resolve_security_ticker_prefers_openfigi_cusip(self) -> None:
+        old_openfigi = self.mod.openfigi_ticker
+        self.mod.YAHOO_SEARCH_CACHE.clear()
+        try:
+            self.mod.openfigi_ticker = lambda cusip: "GOOGL"
+            ticker = self.mod.resolve_security_ticker("Alphabet Inc., Class A", "02079K305", {})
+        finally:
+            self.mod.openfigi_ticker = old_openfigi
+        self.assertEqual(ticker, "GOOGL")
 
 
 if __name__ == "__main__":

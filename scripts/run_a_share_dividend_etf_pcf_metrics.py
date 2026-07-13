@@ -30,6 +30,7 @@ from pcf_common import (
     annualized_return as common_annualized_return,
     earnings_yield_pe as common_earnings_yield_pe,
     normalize_price_frame as common_normalize_price_frame,
+    price_series_metrics,
     weighted_average as common_weighted_average,
 )
 
@@ -323,7 +324,7 @@ def get_sse_pcf_holdings(etf: str) -> tuple[pd.DataFrame, str]:
         if amount is None and not (market in A_MARKETS and is_a_stock_code(code) and quantity and quantity > 0):
             continue
         if amount is not None and amount <= 0:
-            continue
+            amount = None
         rows.append(
             {
                 "股票代码": code,
@@ -567,47 +568,36 @@ def summarize_period_return(temp: pd.DataFrame, days: int) -> float | None:
 
 
 def risk_metrics_from_price_frame(temp: pd.DataFrame) -> dict[str, Any]:
-    if len(temp) < 30:
-        return {"volatility_pct": None, "sortino_ratio": None, "risk_observations": len(temp)}
-    sample = temp.copy()
-    sample["ret"] = sample["value"].pct_change()
-    sample = sample.dropna()
-    if len(sample) < 20:
-        return {"volatility_pct": None, "sortino_ratio": None, "risk_observations": len(sample)}
-    volatility = float(sample["ret"].std(ddof=1)) * math.sqrt(TRADING_DAYS_PER_YEAR)
-    mean_daily = float(sample["ret"].mean())
-    downside = sample.loc[sample["ret"] < 0, "ret"]
-    sortino = None
-    if len(downside) > 1:
-        downside_dev = float((downside.pow(2).mean()) ** 0.5)
-        if downside_dev > 0:
-            sortino = mean_daily * TRADING_DAYS_PER_YEAR / (downside_dev * math.sqrt(TRADING_DAYS_PER_YEAR))
+    if temp.empty:
+        return {"volatility_pct": None, "sortino_ratio": None, "risk_observations": 0}
+    series = pd.Series(temp["value"].to_numpy(float), index=pd.DatetimeIndex(temp["date"]))
+    metrics = price_series_metrics(series)
     return {
-        "volatility_pct": volatility * 100,
-        "sortino_ratio": sortino,
-        "risk_observations": len(sample),
+        "volatility_pct": metrics.get("volatility_pct"),
+        "sortino_ratio": metrics.get("sortino_ratio"),
+        "risk_observations": max(len(temp) - 1, 0),
     }
 
 
 def summarize_return_series(temp: pd.DataFrame, source: str) -> dict[str, Any]:
     if len(temp) < 2:
         return {"source": source, "error": "not enough observations"}
-    last_date = temp["date"].max().date()
-    one_year_floor = pd.Timestamp(last_date - timedelta(days=366))
-    one_year = temp[temp["date"] >= one_year_floor]
-    first = one_year.iloc[0]
-    last = one_year.iloc[-1]
-    ann = annualized_return(float(first["value"]), float(last["value"]), first["date"].date(), last["date"].date())
-    risk = risk_metrics_from_price_frame(one_year)
+    series = pd.Series(temp["value"].to_numpy(float), index=pd.DatetimeIndex(temp["date"]))
+    metrics = price_series_metrics(series)
+    if metrics.get("error"):
+        return {"source": source, "error": metrics["error"]}
     return {
         "source": source,
-        "annualized_return_pct": None if ann is None else ann * 100,
-        "half_year_return_pct": summarize_period_return(temp, 183),
-        "one_year_return_pct": summarize_period_return(temp, 366),
-        "three_year_return_pct": summarize_period_return(temp, 366 * 3),
-        "return_window": f"{one_year.iloc[0]['date'].date()} to {one_year.iloc[-1]['date'].date()}",
-        "risk_window": f"{one_year.iloc[0]['date'].date()} to {one_year.iloc[-1]['date'].date()}",
-        **risk,
+        "return_basis": "total_return_or_adjusted" if "nav" in source or "qfq" in source else "unadjusted_price_return",
+        "annualized_return_pct": metrics["annualized_return_pct"],
+        "half_year_return_pct": metrics["half_year_return_pct"],
+        "one_year_return_pct": metrics["one_year_return_pct"],
+        "three_year_return_pct": metrics["three_year_return_pct"],
+        "return_window": metrics["return_window"],
+        "risk_window": metrics["risk_window"],
+        "volatility_pct": metrics["volatility_pct"],
+        "sortino_ratio": metrics["sortino_ratio"],
+        "max_drawdown_pct": metrics["max_drawdown_pct"],
     }
 
 
@@ -622,16 +612,16 @@ def get_returns(etf: str) -> dict[str, Any]:
     except Exception as exc:
         candidates.append({"source": "eastmoney_nav", "error": str(exc)})
     try:
-        price = ak.fund_etf_hist_em(symbol=etf, period="daily", start_date=start, end_date=end, adjust="")
-        candidates.append(summarize_return_series(normalize_price_frame(price, "日期", "收盘"), "eastmoney_price"))
+        price = ak.fund_etf_hist_em(symbol=etf, period="daily", start_date=start, end_date=end, adjust="qfq")
+        candidates.append(summarize_return_series(normalize_price_frame(price, "日期", "收盘"), "eastmoney_price_qfq"))
     except Exception as exc:
-        candidates.append({"source": "eastmoney_price", "error": str(exc)})
+        candidates.append({"source": "eastmoney_price_qfq", "error": str(exc)})
     try:
         sina = ak.fund_etf_hist_sina(symbol=f"{code_market(etf)}{etf}")
         candidates.append(summarize_return_series(normalize_price_frame(sina, "date", "close"), "sina_price"))
     except Exception as exc:
         candidates.append({"source": "sina_price", "error": str(exc)})
-    for source in ("eastmoney_nav", "eastmoney_price", "sina_price"):
+    for source in ("eastmoney_nav", "eastmoney_price_qfq", "sina_price"):
         for item in candidates:
             if item.get("source") == source and not item.get("error") and item.get("annualized_return_pct") is not None:
                 return item
@@ -700,6 +690,9 @@ def build_metrics_for_etf(
                 "持仓来源": source,
                 "A股持仓权重%": a_weight,
                 "股票持仓数": len(a_holdings),
+                "PCF原始股票行数": len(a_holdings),
+                "有效权重行数": int(a_holdings["权重%"].notna().sum()),
+                "未定价/缺失权重行数": int(a_holdings["权重%"].isna().sum()),
                 "股息率%": dy,
                 "PE": pe,
                 "PB": pb,
@@ -710,6 +703,7 @@ def build_metrics_for_etf(
                 "近一年收益%": returns.get("one_year_return_pct"),
                 "近3年收益%": returns.get("three_year_return_pct"),
                 "收益来源": returns.get("source"),
+                "收益口径": returns.get("return_basis"),
                 "收益区间": returns.get("return_window"),
                 "风险指标区间": returns.get("risk_window"),
                 "PE覆盖权重%": pe_cov,

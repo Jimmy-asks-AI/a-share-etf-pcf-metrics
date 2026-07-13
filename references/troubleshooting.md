@@ -101,6 +101,7 @@ Audit:
 
 - Check `ETF内股票权重合计%` in `etf_summary.csv`.
 - Check `权重来源` in `lookthrough_detail.csv`.
+- Check `PCF原始股票行数`, `有效权重行数`, and `未定价/缺失权重行数` before treating the residual as cash.
 
 ## Suspicious PE/PB Values
 
@@ -109,6 +110,11 @@ Checks:
 - Inspect `PE覆盖权重%`, `PB覆盖权重%`, and `负PE权重%`.
 - For PE, the aggregate uses earnings-yield aggregation and excludes non-positive PE from the denominator.
 - Very low coverage means the metric should not be used as a ranking signal without manual review.
+- Valuation constraints require at least 80% coverage by default; lower coverage is reported as `数据不足`.
+
+## Requested ETF Missing From Ranking
+
+Requested ETFs are no longer silently removed. Check `数据状态` and `错误` in the final CSV/XLSX. `覆盖不足` rows remain visible but do not receive an effective dividend rank; `失败` rows retain the source error.
 
 ## Generated Files Were Removed
 
@@ -123,7 +129,7 @@ Use this when debugging:
 python scripts\run_pcf_metrics.py --etf 513690,159569 --keep-intermediates
 ```
 
-The selected ETF script keeps its detailed outputs by design.
+The selected ETF script keeps only core CSV/XLSX/manifest files by default. Add `--full-output` for auxiliary CSV/Markdown/HTML files and `--cache` for holdings snapshots.
 
 ## Rate Limits
 
@@ -135,4 +141,3 @@ python scripts\selected_etf_lookthrough.py --etf 159569,159758 --hk-sleep 0.15 -
 ```
 
 If failures are intermittent, re-run the same command after a few minutes.
-

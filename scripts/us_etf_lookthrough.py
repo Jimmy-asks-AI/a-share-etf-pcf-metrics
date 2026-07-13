@@ -81,7 +81,7 @@ def get_sse_pcf_holdings(etf: str) -> tuple[pd.DataFrame, str]:
             continue
         amount = clean_float(row.get("SUBSTITUTION_CASH_AMOUNT"))
         weight = _weight_from_amount(amount, nav_per_cu)
-        if not ticker or weight is None:
+        if not ticker:
             continue
         quantity = clean_float(row.get("QUANTITY"))
         rows.append(
@@ -227,7 +227,7 @@ def get_szse_pcf_holdings(etf: str) -> tuple[pd.DataFrame, str]:
                 fx_error = str(exc)
                 error = fx_error
         weight = _weight_from_amount(amount, nav_per_cu)
-        if not ticker or weight is None:
+        if not ticker:
             continue
         rows.append(
             {

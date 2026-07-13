@@ -28,7 +28,7 @@ try:
 except Exception:  # pragma: no cover - tests can run without akshare network deps
     ak = None  # type: ignore[assignment]
 
-from pcf_common import earnings_yield_pe, to_float, weighted_average
+from pcf_common import combine_price_series, earnings_yield_pe, price_series_metrics, to_float, weighted_average
 
 
 C_ETF_CODE = "ETF代码"
@@ -88,6 +88,7 @@ SEC_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 ROUNDHILL_TICKERS = {"DRAM"}
+YAHOO_SEARCH_CACHE: dict[str, str] = {}
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,55 @@ def company_name_key(value: str) -> str:
     return " ".join(words)
 
 
+def openfigi_ticker(cusip: str) -> str:
+    response = requests.post(
+        "https://api.openfigi.com/v3/mapping",
+        json=[{"idType": "ID_CUSIP", "idValue": cusip}],
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    for item in ((payload or [{}])[0].get("data") or []):
+        if item.get("exchCode") == "US" and item.get("marketSector") == "Equity":
+            ticker = normalize_us_ticker(item.get("ticker"))
+            if ticker:
+                return ticker
+    return ""
+
+
+def resolve_security_ticker(name: str, cusip: str, ticker_by_name: dict[str, str]) -> str:
+    exact = ticker_by_name.get(company_name_key(name))
+    if exact:
+        return exact
+    if cusip in YAHOO_SEARCH_CACHE:
+        return YAHOO_SEARCH_CACHE[cusip]
+    if re.fullmatch(r"[A-Z0-9]{9}", cusip.upper()):
+        try:
+            ticker = openfigi_ticker(cusip)
+            if ticker:
+                YAHOO_SEARCH_CACHE[cusip] = ticker
+                return ticker
+        except Exception:
+            pass
+        try:
+            for query in (cusip, name):
+                payload = request_json(
+                    "https://query1.finance.yahoo.com/v1/finance/search",
+                    params={"q": query, "quotesCount": 10, "newsCount": 0},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                for quote in payload.get("quotes") or []:
+                    symbol = normalize_us_ticker(quote.get("symbol"))
+                    exchange = str(quote.get("exchange") or "").upper()
+                    if symbol and quote.get("quoteType") in {"EQUITY", "ETF"} and exchange in {"NMS", "NGM", "NCM", "NYQ", "PCX", "BTS", "NAS"}:
+                        YAHOO_SEARCH_CACHE[cusip] = symbol
+                        return symbol
+        except Exception:
+            pass
+    return cusip or name
+
+
 def sec_ticker_maps() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
     data = request_json("https://www.sec.gov/files/company_tickers_exchange.json")
     cik_by_ticker: dict[str, str] = {}
@@ -326,7 +376,7 @@ def fetch_sec_nport_holdings(ticker: str) -> tuple[list[Holding], dict[str, Any]
         weight = clean_number(find_text(inv, "pctVal"))
         if weight is None:
             continue
-        security_ticker = ticker_by_name.get(company_name_key(name), cusip or name)
+        security_ticker = resolve_security_ticker(name, cusip, ticker_by_name)
         asset = find_text(inv, "assetCat")
         country = find_text(inv, "invCountry")
         market = "US" if asset == "EC" and country == "US" else (country or asset or "OTHER")
@@ -646,6 +696,7 @@ def build_tables(tickers: list[str], weights: list[float], source: str, cache_di
                 C_PERIOD: meta.get("period"),
                 C_SOURCE: meta.get("source"),
                 C_SOURCE_DETAIL: meta.get("source_detail"),
+                "穿透口径": "SEC N-PORT报告持仓" if meta.get("source") == "sec_nport" else "发行商报告持仓",
                 "底层持仓数": len(holdings),
                 "ETF内权重合计%": sum(item.weight_pct for item in holdings),
                 "数据缺口": meta.get("known_gap", ""),
@@ -723,6 +774,44 @@ def aggregate_valuation(frame: pd.DataFrame, weight_col: str) -> dict[str, Any]:
     }
 
 
+def yahoo_chart_series(symbol: str, lookback_days: int) -> pd.Series:
+    end = int(time.time())
+    payload = request_json(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        params={"period1": end - lookback_days * 86400, "period2": end + 86400, "interval": "1d", "events": "div,splits"},
+    )
+    result = ((payload.get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        raise RuntimeError(f"Yahoo chart returned no data for {symbol}")
+    timestamps = result.get("timestamp") or []
+    indicators = result.get("indicators") or {}
+    adjusted = ((indicators.get("adjclose") or [{}])[0].get("adjclose") or [])
+    closes = ((indicators.get("quote") or [{}])[0].get("close") or [])
+    values = adjusted if len(adjusted) == len(timestamps) else closes
+    temp = pd.DataFrame({"date": pd.to_datetime(timestamps, unit="s", errors="coerce"), "close": values})
+    temp["close"] = pd.to_numeric(temp["close"], errors="coerce")
+    temp = temp.dropna().sort_values("date").drop_duplicates("date", keep="last")
+    if len(temp) < 30:
+        raise RuntimeError(f"Yahoo chart too short for {symbol}: {len(temp)}")
+    return pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"]))
+
+
+def fx_series(lookback_days: int, cache_dir: Path | None = None) -> tuple[pd.Series, str]:
+    cache_path = None if cache_dir is None else cache_dir / f"prices_USDCNY_{lookback_days}.csv"
+    if cache_path is not None and cache_path.exists():
+        temp = pd.read_csv(cache_path)
+        temp["date"] = pd.to_datetime(temp["date"], errors="coerce")
+        temp["close"] = pd.to_numeric(temp["close"], errors="coerce")
+        temp = temp.dropna().sort_values("date")
+        if len(temp) >= 30:
+            return pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"])), f"cache:{cache_path.name}"
+    series = yahoo_chart_series("CNY=X", lookback_days)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"date": series.index, "close": series.to_numpy()}).to_csv(cache_path, index=False, encoding="utf-8-sig")
+    return series, "yahoo_USD_CNY"
+
+
 def price_series(ticker: str, lookback_days: int, cache_dir: Path | None = None) -> tuple[pd.Series, str]:
     cache_path = None if cache_dir is None else cache_dir / f"prices_{cache_key(ticker)}_{lookback_days}.csv"
     if cache_path is not None and cache_path.exists():
@@ -734,6 +823,14 @@ def price_series(ticker: str, lookback_days: int, cache_dir: Path | None = None)
             return pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"])), f"cache:{cache_path.name}"
     start_date = date.today() - timedelta(days=lookback_days)
     end_date = date.today()
+    try:
+        series = yahoo_chart_series(ticker, lookback_days)
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({"date": series.index, "close": series.to_numpy()}).to_csv(cache_path, index=False, encoding="utf-8-sig")
+        return series, "yahoo_adjusted_chart"
+    except Exception:
+        pass
     try:
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*", "Referer": f"https://www.nasdaq.com/market-activity/etf/{ticker.lower()}"}
         url = f"https://api.nasdaq.com/api/quote/{ticker}/chart?assetclass=etf&fromdate={start_date:%Y-%m-%d}&todate={end_date:%Y-%m-%d}"
@@ -776,41 +873,24 @@ def price_series(ticker: str, lookback_days: int, cache_dir: Path | None = None)
 
 
 def return_metrics(series: pd.Series) -> dict[str, Any]:
-    if len(series) < 30:
-        return {"收益错误": f"price series too short: {len(series)}"}
-    returns = series.pct_change().dropna()
-    downside = returns[returns < 0]
-    ann_return = (series.iloc[-1] / series.iloc[0]) ** (252 / max(len(returns), 1)) - 1
-    volatility = returns.std() * math.sqrt(252)
-    downside_vol = downside.std() * math.sqrt(252) if len(downside) > 1 else None
-    roll_max = series.cummax()
-    max_drawdown = (series / roll_max - 1).min()
-    sharpe = None if volatility == 0 else ann_return / volatility
-    calmar = None if max_drawdown >= 0 else ann_return / abs(max_drawdown)
-    var95 = returns.quantile(0.05)
-    cvar95 = returns[returns <= var95].mean() if not returns.empty else None
-
-    def trailing(days: int) -> float | None:
-        cutoff = series.index[-1] - pd.Timedelta(days=days)
-        sub = series[series.index >= cutoff]
-        if len(sub) < 2:
-            return None
-        return sub.iloc[-1] / sub.iloc[0] - 1
-
+    metrics = price_series_metrics(series)
+    if metrics.get("error"):
+        return {"收益错误": metrics["error"]}
     return {
-        "年化收益%": ann_return * 100,
-        "索提诺比率": None if not downside_vol or downside_vol == 0 else ann_return / downside_vol,
-        "波动率%": volatility * 100,
-        "近半年收益%": None if trailing(183) is None else trailing(183) * 100,
-        "近一年收益%": None if trailing(365) is None else trailing(365) * 100,
-        "近3年收益%": None if trailing(365 * 3) is None else trailing(365 * 3) * 100,
-        "最大回撤%": max_drawdown * 100,
-        "Sharpe Ratio": sharpe,
-        "Calmar Ratio": calmar,
-        "VaR95%": var95 * 100,
-        "CVaR95%": None if cvar95 is None else cvar95 * 100,
-        "下行波动率%": None if downside_vol is None else downside_vol * 100,
-        "收益区间": f"{series.index[0].date()}~{series.index[-1].date()}",
+        "年化收益%": metrics["annualized_return_pct"],
+        "索提诺比率": metrics["sortino_ratio"],
+        "波动率%": metrics["volatility_pct"],
+        "近半年收益%": metrics["half_year_return_pct"],
+        "近一年收益%": metrics["one_year_return_pct"],
+        "近3年收益%": metrics["three_year_return_pct"],
+        "最大回撤%": metrics["max_drawdown_pct"],
+        "Sharpe Ratio": metrics["sharpe_ratio"],
+        "Calmar Ratio": metrics["calmar_ratio"],
+        "VaR95%": metrics["var95_pct"],
+        "CVaR95%": metrics["cvar95_pct"],
+        "下行波动率%": metrics["downside_volatility_pct"],
+        "收益区间": metrics["return_window"],
+        "风险指标区间": metrics["risk_window"],
     }
 
 
@@ -825,20 +905,18 @@ def build_metrics(tickers: list[str], weights: list[float], detail: pd.DataFrame
             series_map[ticker] = series
             row.update(return_metrics(series))
             row["收益来源"] = row.get("收益来源") or source
+            row["收益口径"] = "总收益/复权" if "adjusted" in source or "qfq" in source else "价格收益(未计现金分红)"
+            row["收益币种"] = "USD"
         rows.append(row)
     portfolio = {"类型": "组合", C_ETF_CODE: "PORTFOLIO", C_ETF_WEIGHT: 100.0, **aggregate_valuation(detail, C_PORTFOLIO_WEIGHT)}
     if not skip_metrics and series_map:
-        returns = []
-        for ticker, weight in zip(tickers, weights):
-            series = series_map.get(ticker)
-            if series is None or len(series) < 2:
-                continue
-            returns.append(series.pct_change().dropna().rename(ticker) * weight)
-        if returns:
-            combo_returns = pd.concat(returns, axis=1).dropna().sum(axis=1)
-            combo = (1 + combo_returns).cumprod()
+        combo = combine_price_series(series_map, dict(zip(tickers, weights)))
+        if not combo.empty:
             portfolio.update(return_metrics(combo))
             portfolio["收益来源"] = "portfolio_price_combination"
+            portfolio["收益口径"] = "总收益/复权"
+            portfolio["收益币种"] = "USD"
+            portfolio["组合构造"] = "初始权重买入并持有"
     rows.append(portfolio)
     return pd.DataFrame(rows)
 
@@ -863,12 +941,15 @@ def valuation_buckets(summary: pd.DataFrame) -> pd.DataFrame:
 
 
 def overlap_pairs(detail: pd.DataFrame) -> pd.DataFrame:
+    detail = detail.copy()
+    if C_MARKET not in detail.columns:
+        detail[C_MARKET] = "US"
     rows = []
     etfs = sorted(detail[C_ETF_CODE].dropna().unique())
     for i, left in enumerate(etfs):
         for right in etfs[i + 1 :]:
-            a = detail[detail[C_ETF_CODE].eq(left)].groupby(C_STOCK_CODE)[C_INNER_WEIGHT].sum()
-            b = detail[detail[C_ETF_CODE].eq(right)].groupby(C_STOCK_CODE)[C_INNER_WEIGHT].sum()
+            a = detail[detail[C_ETF_CODE].eq(left)].groupby([C_MARKET, C_STOCK_CODE])[C_INNER_WEIGHT].sum()
+            b = detail[detail[C_ETF_CODE].eq(right)].groupby([C_MARKET, C_STOCK_CODE])[C_INNER_WEIGHT].sum()
             common = a.index.intersection(b.index)
             rows.append({"ETF1": left, "ETF2": right, "共同持仓数": len(common), "重合权重%": float(pd.concat([a[common], b[common]], axis=1).min(axis=1).sum()) if len(common) else 0.0})
     return pd.DataFrame(rows)
@@ -882,12 +963,16 @@ def constraint_checks(summary: pd.DataFrame, metrics: pd.DataFrame, args: argpar
     portfolio = metrics[metrics[C_ETF_CODE].eq("PORTFOLIO")]
     if args.min_dividend_yield is not None and not portfolio.empty:
         actual = to_float(portfolio.iloc[0].get("股息率%"))
-        rows.append({"约束": "组合最低股息率", "阈值": args.min_dividend_yield, "实际值": actual, "结果": "未知" if actual is None else ("通过" if actual >= args.min_dividend_yield else "不通过")})
+        coverage = to_float(portfolio.iloc[0].get("股息率覆盖权重%"))
+        status = "数据不足" if coverage is None or coverage < args.min_metric_coverage else ("未知" if actual is None else ("通过" if actual >= args.min_dividend_yield else "不通过"))
+        rows.append({"约束": "组合最低股息率", "阈值": args.min_dividend_yield, "实际值": actual, "覆盖权重%": coverage, "结果": status})
     for attr, metric_name, label in [("max_pe", "PE", "组合最高PE"), ("max_pb", "PB", "组合最高PB")]:
         threshold = getattr(args, attr, None)
         if threshold is not None and not portfolio.empty:
             actual = to_float(portfolio.iloc[0].get(metric_name))
-            rows.append({"约束": label, "阈值": threshold, "实际值": actual, "结果": "未知" if actual is None else ("通过" if actual <= threshold else "不通过")})
+            coverage = to_float(portfolio.iloc[0].get(f"{metric_name}覆盖权重%"))
+            status = "数据不足" if coverage is None or coverage < args.min_metric_coverage else ("未知" if actual is None else ("通过" if actual <= threshold else "不通过"))
+            rows.append({"约束": label, "阈值": threshold, "实际值": actual, "覆盖权重%": coverage, "结果": status})
     if args.max_sector_weight is not None and detail is not None and C_PORTFOLIO_WEIGHT in detail:
         group_col = C_SECTOR if C_SECTOR in detail and detail[C_SECTOR].fillna("").astype(str).ne("").any() else C_INDUSTRY
         exposure = detail.groupby(group_col)[C_PORTFOLIO_WEIGHT].sum() if group_col in detail else pd.Series(dtype=float)
@@ -1042,13 +1127,12 @@ def build_parser() -> argparse.ArgumentParser:
     cache_group = parser.add_mutually_exclusive_group()
     cache_group.add_argument("--cache", dest="use_cache", action="store_true", default=False, help="Write holdings, metrics, and price cache files.")
     cache_group.add_argument("--no-cache", dest="use_cache", action="store_false", help="Do not write cache files. Default.")
-    parser.add_argument("--recursive-etf-lookthrough", action="store_true", help="Accepted but not expanded yet.")
-    parser.add_argument("--max-depth", type=int, default=1)
     parser.add_argument("--max-stock-weight", type=float)
     parser.add_argument("--max-sector-weight", type=float)
     parser.add_argument("--min-dividend-yield", type=float)
     parser.add_argument("--max-pe", type=float)
     parser.add_argument("--max-pb", type=float)
+    parser.add_argument("--min-metric-coverage", type=float, default=80.0)
     parser.add_argument("--nav-lookback-days", type=int, default=365 * 3 + 120)
     parser.add_argument("--lookback-days", dest="nav_lookback_days", type=int)
     parser.add_argument("--metrics-workers", type=int, default=8)
@@ -1076,7 +1160,7 @@ def main(argv: list[str] | None = None) -> int:
         "failed_tickers": failed,
         "known_gaps": [
             "SEC NPORT holdings are full but delayed.",
-            "Recursive ETF-of-ETF expansion is accepted by CLI but not enabled in v1.",
+            "ETF-of-ETF, derivative, ETN, commodity-trust, and crypto-trust exposures are reported but not recursively expanded.",
         ],
         "row_counts": {"summary": len(summary), "detail": len(detail), "etf_summary": len(etf_summary), "metrics_summary": len(metrics)},
         "columns": {

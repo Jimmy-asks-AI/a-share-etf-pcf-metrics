@@ -24,6 +24,7 @@ from pcf_common import (
     annualized_return as common_annualized_return,
     earnings_yield_pe as common_earnings_yield_pe,
     normalize_price_frame as common_normalize_price_frame,
+    price_series_metrics,
     weighted_average as common_weighted_average,
 )
 
@@ -317,20 +318,27 @@ def get_sse_pcf_holdings(etf: str) -> tuple[pd.DataFrame, str]:
         market = SSE_MARKET_MAP.get(str(row.get("UNDERLYION_SECURITY_ID") or ""), "OTHER")
         code = normalize_hk_code(row.get("INSTRUMENT_ID"))
         amount = clean_float(row.get("SUBSTITUTION_CASH_AMOUNT"))
-        if amount is None or amount <= 0:
+        quantity = clean_float(row.get("QUANTITY"))
+        weight_source = "SUBSTITUTION_CASH_AMOUNT/NAVPERCU"
+        if (amount is None or amount <= 0) and market == "HK" and quantity and quantity > 0:
+            price_hkd = get_hk_spot_price_hkd(code)
+            if price_hkd is not None:
+                amount = quantity * price_hkd * get_hkd_cny_rate()
+                weight_source = "QUANTITY*HK spot price*HKD/CNY/NAVPERCU"
+        if market != "HK" or not re.fullmatch(r"\d{5}", code):
             continue
         rows.append(
             {
                 "股票代码": code,
                 "股票名称": str(row.get("INSTRUMENT_NAME") or ""),
-                "占净值比例": amount / nav_per_cu * 100,
+                "占净值比例": None if amount is None or amount <= 0 else amount / nav_per_cu * 100,
                 "持仓市值": amount,
                 "季度": period,
                 "holding_source": "sse_pcf",
                 "holding_source_detail": f"SSE ETF PCF {trading_day}".strip(),
                 "market": market,
-                "weight_source": "SUBSTITUTION_CASH_AMOUNT/NAVPERCU",
-                "pcf_quantity": clean_float(row.get("QUANTITY")),
+                "weight_source": weight_source,
+                "pcf_quantity": quantity,
                 "pcf_substitution_flag": str(row.get("SUBSTITUTION_FLAG") or ""),
             }
         )
@@ -447,13 +455,13 @@ def get_szse_pcf_holdings(etf: str) -> tuple[pd.DataFrame, str]:
             if price_hkd is not None:
                 underlying_amount = quantity * price_hkd * get_hkd_cny_rate()
                 weight_source = "ComponentShare*HK spot price*HKD/CNY/NAVperCU"
-        if underlying_amount is None or underlying_amount <= 0:
+        if market != "HK" or not re.fullmatch(r"\d{5}", code):
             continue
         rows.append(
             {
                 "股票代码": code,
                 "股票名称": find_name(node, "UnderlyingSymbol"),
-                "占净值比例": underlying_amount / nav_per_cu * 100,
+                "占净值比例": None if underlying_amount is None or underlying_amount <= 0 else underlying_amount / nav_per_cu * 100,
                 "持仓市值": underlying_amount,
                 "季度": period,
                 "holding_source": "szse_pcf",
@@ -663,47 +671,39 @@ def trailing_total_return(temp: pd.DataFrame, days_back: int, min_days: int) -> 
 
 
 def risk_metrics_from_price_frame(temp: pd.DataFrame) -> dict[str, Any]:
-    if temp.empty or len(temp) < 2:
+    if temp.empty:
         return {"volatility_pct": None, "sortino_ratio": None, "risk_observations": 0}
-    daily = temp.copy()
-    daily["ret"] = daily["value"].pct_change()
-    daily = daily.dropna(subset=["ret"])
-    one_year = daily[daily["date"].dt.date >= daily["date"].iloc[-1].date() - timedelta(days=365)]
-    sample = one_year if len(one_year) >= 60 else daily
-    if sample.empty:
-        return {"volatility_pct": None, "sortino_ratio": None, "risk_observations": 0}
-    mean_daily = float(sample["ret"].mean())
-    volatility = float(sample["ret"].std(ddof=1)) * math.sqrt(TRADING_DAYS_PER_YEAR) if len(sample) > 1 else None
-    downside = sample.loc[sample["ret"] < 0, "ret"]
-    downside_dev = float((downside.pow(2).mean()) ** 0.5) if not downside.empty else None
-    annual_return = (1 + mean_daily) ** TRADING_DAYS_PER_YEAR - 1 if mean_daily > -1 else None
-    sortino = None
-    if annual_return is not None and downside_dev and downside_dev > 0:
-        sortino = annual_return / (downside_dev * math.sqrt(TRADING_DAYS_PER_YEAR))
+    series = pd.Series(temp["value"].to_numpy(float), index=pd.DatetimeIndex(temp["date"]))
+    metrics = price_series_metrics(series)
     return {
-        "volatility_pct": None if volatility is None else volatility * 100,
-        "sortino_ratio": sortino,
-        "risk_observations": int(len(sample)),
-        "risk_window": f"{sample['date'].iloc[0].date()} to {sample['date'].iloc[-1].date()}",
+        "volatility_pct": metrics.get("volatility_pct"),
+        "sortino_ratio": metrics.get("sortino_ratio"),
+        "risk_observations": max(len(temp) - 1, 0),
+        "risk_window": metrics.get("risk_window", ""),
     }
 
 
 def summarize_return_series(temp: pd.DataFrame, source: str) -> dict[str, Any]:
     if temp.empty:
         return {"source": source, "error": "empty return frame"}
-    one_year = value_window(temp, days_back=365, min_days=330)
-    risk = risk_metrics_from_price_frame(temp)
+    series = pd.Series(temp["value"].to_numpy(float), index=pd.DatetimeIndex(temp["date"]))
+    metrics = price_series_metrics(series)
+    if metrics.get("error"):
+        return {"source": source, "error": metrics["error"]}
     return {
         "source": source,
-        "annualized_return_pct": one_year.get("annualized_return_pct") if not one_year.get("error") else None,
-        "half_year_return_pct": trailing_total_return(temp, days_back=183, min_days=150),
-        "one_year_return_pct": trailing_total_return(temp, days_back=365, min_days=330),
-        "three_year_return_pct": trailing_total_return(temp, days_back=365 * 3, min_days=900),
-        "first_date": one_year.get("first_date"),
-        "last_date": one_year.get("last_date"),
-        "days": one_year.get("days"),
-        "short_window": one_year.get("short_window", True),
-        **risk,
+        "return_basis": "total_return_or_adjusted" if "nav" in source or "qfq" in source else "unadjusted_price_return",
+        "annualized_return_pct": metrics["annualized_return_pct"],
+        "half_year_return_pct": metrics["half_year_return_pct"],
+        "one_year_return_pct": metrics["one_year_return_pct"],
+        "three_year_return_pct": metrics["three_year_return_pct"],
+        "first_date": metrics["return_window"].split(" to ")[0] if metrics["return_window"] else None,
+        "last_date": metrics["return_window"].split(" to ")[-1] if metrics["return_window"] else None,
+        "short_window": metrics["annualized_return_pct"] is None,
+        "volatility_pct": metrics["volatility_pct"],
+        "sortino_ratio": metrics["sortino_ratio"],
+        "risk_window": metrics["risk_window"],
+        "max_drawdown_pct": metrics["max_drawdown_pct"],
     }
 
 
@@ -716,7 +716,7 @@ def get_returns(etf: str) -> dict[str, Any]:
         last_exc: Exception | None = None
         for _ in range(2):
             try:
-                em = ak.fund_etf_hist_em(symbol=etf, period="daily", start_date=start, end_date=end, adjust="")
+                em = ak.fund_etf_hist_em(symbol=etf, period="daily", start_date=start, end_date=end, adjust="qfq")
                 break
             except Exception as exc:
                 last_exc = exc
@@ -724,9 +724,9 @@ def get_returns(etf: str) -> dict[str, Any]:
         if em is None:
             raise RuntimeError(str(last_exc))
         em_frame = normalize_price_frame(em, "日期", "收盘")
-        result["eastmoney_price"] = summarize_return_series(em_frame, "eastmoney_price")
+        result["eastmoney_price_qfq"] = summarize_return_series(em_frame, "eastmoney_price_qfq")
     except Exception as exc:
-        result["eastmoney_price"] = {"source": "eastmoney_price", "error": str(exc)}
+        result["eastmoney_price_qfq"] = {"source": "eastmoney_price_qfq", "error": str(exc)}
     try:
         nav = ak.fund_etf_fund_info_em(fund=etf, start_date=start, end_date=end)
         value_col = "累计净值" if "累计净值" in nav.columns else "单位净值"
@@ -853,7 +853,7 @@ def format_num(value: Any, digits: int = 2, suffix: str = "") -> str:
 
 
 def best_return_source(returns: dict[str, Any]) -> tuple[str, float | None]:
-    for source in ("eastmoney_price", "eastmoney_nav", "sina_price"):
+    for source in ("eastmoney_nav", "eastmoney_price_qfq", "sina_price"):
         value = returns.get(source, {}).get("annualized_return_pct")
         if value is not None:
             return source, value
@@ -961,8 +961,14 @@ def analyze_etf(
     holdings_source: str = "auto",
 ) -> dict[str, Any]:
     holdings, period = get_latest_holdings(etf, holdings_source=holdings_source)
+    hk_mask = holdings["股票代码"].astype(str).str.match(HK_CODE_RE)
+    raw_hk_rows = int(hk_mask.sum())
+    missing_weight_rows = int(pd.to_numeric(holdings.loc[hk_mask, "占净值比例"], errors="coerce").isna().sum())
     metrics = build_metrics(holdings, alt_limit=alt_limit, sleep_seconds=sleep_seconds)
     summary = summarize(metrics)
+    summary["raw_hk_rows"] = raw_hk_rows
+    summary["effective_hk_rows"] = len(metrics)
+    summary["missing_weight_rows"] = missing_weight_rows
     returns = get_returns(etf)
     actual_sources = sorted({item.holding_source for item in metrics if item.holding_source})
     source_details = sorted({item.holding_source_detail for item in metrics if item.holding_source_detail})
@@ -1014,14 +1020,20 @@ def write_summary(results: list[dict[str, Any]], out_dir: Path, rank_by_dividend
                 "holdings_period": result["holdings_period"],
                 "holdings_source": result.get("holdings_source", ""),
                 "hk_weight_pct": s["total_hk_weight_pct"],
+                "raw_hk_rows": s.get("raw_hk_rows"),
+                "effective_hk_rows": s.get("effective_hk_rows"),
+                "missing_weight_rows": s.get("missing_weight_rows"),
                 "dividend_yield_pct": s["dividend_yield_pct"],
+                "dividend_yield_coverage_pct": s["coverage"]["dividend_yield_weight_pct"],
                 "pb": s["pb"],
+                "pb_coverage_pct": s["coverage"]["pb_weight_pct"],
                 "pe_simple": s["pe_simple"],
                 "pe_positive": s["pe_positive_simple"],
                 "pe_earnings_yield": s["pe_earnings_yield"],
                 "pe_coverage_pct": s["coverage"]["pe_earnings_yield_weight_pct"],
                 "negative_pe_weight_pct": s["coverage"]["negative_pe_weight_pct"],
                 "annualized_return_source": ref_source,
+                "return_basis": r.get("return_basis"),
                 "annualized_return_pct": ref_return,
                 "sortino_ratio": r.get("sortino_ratio"),
                 "volatility_pct": r.get("volatility_pct"),
