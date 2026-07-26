@@ -223,6 +223,7 @@ def build_structure_analysis(detail: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
 
 def build_industry_theme_exposure(detail: pd.DataFrame) -> pd.DataFrame:
     df = add_classifications(detail)
+    columns = ["分类体系", "分类", "权重%", "股票数", "PE", "PB", "股息率%", "数据源"]
     rows: list[dict[str, Any]] = []
     for source_name, column in [
         ("申万一级行业", "申万一级行业"),
@@ -246,7 +247,11 @@ def build_industry_theme_exposure(detail: pd.DataFrame) -> pd.DataFrame:
                     "数据源": "规则估计，非官方申万/中信" if source_name in {"申万一级行业", "中信一级行业", "规则行业"} else "名称关键词规则",
                 }
             )
-    return pd.DataFrame(rows).sort_values(["分类体系", "权重%"], ascending=[True, False]).reset_index(drop=True)
+    return (
+        pd.DataFrame(rows, columns=columns)
+        .sort_values(["分类体系", "权重%"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
 
 
 def bucket_label(value: float | None, buckets: list[tuple[str, float | None, float | None]]) -> str:
@@ -443,6 +448,10 @@ def build_constraint_checks(
     if portfolio_row.empty and not metrics_summary.empty:
         portfolio_row = metrics_summary.head(1)
     row = portfolio_row.iloc[0] if not portfolio_row.empty else pd.Series(dtype=object)
+    error_value = row.get("错误")
+    error_text = "" if error_value is None or pd.isna(error_value) else str(error_value).strip()
+    missing_rows = to_float(row.get("未定价/缺失权重行数")) or 0
+    lookthrough_complete = not error_text and missing_rows == 0
     checks = []
 
     def add(
@@ -452,9 +461,12 @@ def build_constraint_checks(
         threshold: float | None,
         unit: str = "%",
         coverage: float | None = None,
+        complete: bool = True,
     ) -> None:
         if threshold is None:
             status = "未设置阈值"
+        elif not complete:
+            status = "数据不足"
         elif coverage is not None and coverage < config.min_metric_coverage:
             status = "数据不足"
         elif actual is None:
@@ -467,21 +479,21 @@ def build_constraint_checks(
             status = "未检查"
         checks.append({"约束": name, "实际值": actual, "条件": "" if threshold is None else f"{operator} {threshold}", "单位": unit, "覆盖权重%": coverage, "结果": status})
 
-    add("单一股票权重上限", float(stock_group[C_PORTFOLIO_WEIGHT].max()) if not stock_group.empty else None, "<=", config.max_stock_weight)
+    add("单一股票权重上限", float(stock_group[C_PORTFOLIO_WEIGHT].max()) if not stock_group.empty else None, "<=", config.max_stock_weight, complete=lookthrough_complete)
     max_industry = None
     if not industry_theme.empty:
         industry_rows = industry_theme[industry_theme["分类体系"].eq("规则行业")]
         if not industry_rows.empty:
             max_industry = float(industry_rows["权重%"].max())
-    add("单一行业权重上限", max_industry, "<=", config.max_industry_weight)
-    add("最低股息率", to_float(row.get("股息率%")), ">=", config.min_dividend_yield, coverage=to_float(row.get("股息率覆盖权重%")))
-    add("最高PE", to_float(row.get("PE")), "<=", config.max_pe, "倍", to_float(row.get("PE覆盖权重%")))
-    add("最高PB", to_float(row.get("PB")), "<=", config.max_pb, "倍", to_float(row.get("PB覆盖权重%")))
+    add("单一行业权重上限", max_industry, "<=", config.max_industry_weight, complete=lookthrough_complete)
+    add("最低股息率", to_float(row.get("股息率%")), ">=", config.min_dividend_yield, coverage=to_float(row.get("股息率覆盖权重%")), complete=lookthrough_complete)
+    add("最高PE", to_float(row.get("PE")), "<=", config.max_pe, "倍", to_float(row.get("PE覆盖权重%")), complete=lookthrough_complete)
+    add("最高PB", to_float(row.get("PB")), "<=", config.max_pb, "倍", to_float(row.get("PB覆盖权重%")), complete=lookthrough_complete)
     add("最大回撤限制", to_float(row.get("最大回撤%")), ">=", config.max_drawdown)
     market_weights = df.groupby(C_MARKET)[C_PORTFOLIO_WEIGHT].sum().to_dict() if not df.empty else {}
-    add("A股比例约束", to_float(market_weights.get("A")), ">=", config.target_a_weight)
-    add("港股比例约束", to_float(market_weights.get("HK")), ">=", config.target_hk_weight)
-    add("美股比例约束", to_float(market_weights.get("US")), ">=", config.target_us_weight)
+    add("A股比例约束", to_float(market_weights.get("A")), ">=", config.target_a_weight, complete=lookthrough_complete)
+    add("港股比例约束", to_float(market_weights.get("HK")), ">=", config.target_hk_weight, complete=lookthrough_complete)
+    add("美股比例约束", to_float(market_weights.get("US")), ">=", config.target_us_weight, complete=lookthrough_complete)
     checks.append({"约束": "自动筛选满足条件ETF组合", "实际值": None, "条件": "", "单位": "", "结果": "当前脚本对已选ETF做约束检查；自动筛选需要候选ETF池"})
     checks.append({"约束": "ETF组合再平衡建议", "实际值": None, "条件": "", "单位": "", "结果": "输出当前超限项；权重优化需启用候选池与目标函数"})
     return pd.DataFrame(checks)

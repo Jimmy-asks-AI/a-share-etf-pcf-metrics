@@ -111,10 +111,23 @@ Checks:
 - For PE, the aggregate uses earnings-yield aggregation and excludes non-positive PE from the denominator.
 - Very low coverage means the metric should not be used as a ranking signal without manual review.
 - Valuation constraints require at least 80% coverage by default; lower coverage is reported as `数据不足`.
+- Direct US-listed ETF constituents reject Yahoo PB values below `0.05` or above `1000` as likely share-class/source mismatches. The original value is retained in `估值错误`.
+
+## US-listed Holdings Sources Are Blocked
+
+The Invesco edge can return `406`, and SEC endpoints can return `403`, depending on IP reputation or temporary traffic controls. The script tries issuer data first where supported and SEC N-PORT next. If every source is blocked, it writes the six core audit files, records each source error, and exits with code `1`; it does not substitute a top-10 table or stale cache.
+
+For Invesco, ticker is resolved through the public product catalog to CUSIP before the holdings request. A `406` on the catalog is therefore an upstream access failure, not evidence that the ticker is invalid.
 
 ## Requested ETF Missing From Ranking
 
-Requested ETFs are no longer silently removed. Check `数据状态` and `错误` in the final CSV/XLSX. `覆盖不足` rows remain visible but do not receive an effective dividend rank; `失败` rows retain the source error.
+Requested ETFs are no longer silently removed. Check `数据状态` and `错误` in the final CSV/XLSX. `有效` requires dividend yield, PE and PB to be present with at least 80% coverage each. `覆盖不足` rows remain visible but do not receive a dividend rank; `失败` rows retain the source error. In `auto` mode, a real A/HK/US parser failure is also retained instead of being hidden by another market's partial result.
+
+Old unversioned cache files are intentionally ignored. Run with `--refresh-cache` to remove them; the flag works even when the current run does not enable `--cache`.
+
+For `us_listed_etf_lookthrough.py`, an all-failed holdings run still writes the six core audit files but exits with code `1`. Read `etf_summary.csv`, `metrics_summary.csv`, and `run_manifest.json` for the per-ticker errors.
+
+If a portfolio has any failed ETF or unresolved component row, holdings-dependent constraints report `数据不足`. The observed exposure remains in the report for diagnosis, but it is not treated as proof that the threshold passed.
 
 ## Generated Files Were Removed
 

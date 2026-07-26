@@ -45,6 +45,16 @@ python "$SKILL_DIR\scripts\run_pcf_metrics.py" --input ".\my_etf_list.csv" --cod
 
 默认会删除中间 CSV/JSON/MD 文件。调试或审计来源数据时加 `--keep-intermediates`。
 
+## A 股红利关键词 ETF
+
+扫描名称含“红利”“分红”“股息”、且底层主要为 A 股的 ETF：
+
+```powershell
+python "$SKILL_DIR\scripts\run_a_share_dividend_etf_pcf_metrics.py" --out-dir a-share-dividend-output
+```
+
+最终表为 `a_share_dividend_etf_pcf_metrics.csv` 和 `.xlsx`。失败候选保留在最终表；股息率、PE、PB 任一指标为空或覆盖权重低于 80% 的行不标记为“有效”或参与排名。全部候选失败时必须返回非零状态。
+
 ## 批量美股成分 ETF 排名
 
 用于 A 股上市、底层为美股的 ETF/QDII：
@@ -73,12 +83,13 @@ python "$SKILL_DIR\scripts\us_listed_etf_lookthrough.py" --ticker QQQ.US,DRAM.US
 - 美股 ETF ticker 解析先用 SEC mutual fund/class ticker map，再用 SEC exchange ticker map，不限于手写交易所样例。
 - SEC NPORT fallback 能给出完整持仓，但相对当前日持仓有滞后。
 - `DRAM` 等 Roundhill ETF 优先使用发行商每日持仓 CSV。
-- `QQQ` 在 Invesco 接口拦截脚本请求时，可退回 SEC NPORT 完整持仓。
+- Invesco ETF 先从产品目录把 ticker 解析为 CUSIP，再请求持仓接口；若边缘节点拒绝请求，可退回 SEC NPORT 完整持仓。
 - 成分股 PE/PB、价格、股息率优先来自 Yahoo quoteSummary。
-- SEC N-PORT 只给 CUSIP 时，先用无需 API key 的 OpenFIGI 映射美股 ticker，再用 Yahoo 搜索兜底。
+- SEC N-PORT 只给 CUSIP 时，先用无需 API key 的 OpenFIGI 映射 Yahoo symbol，再用 Yahoo 搜索兜底；允许国际股票结果。无法映射时保留证券身份并记录错误，不得把 CUSIP 或公司名直接当作 ticker。
+- 发行商文件中的韩国、日本、台湾、香港和 A 股常见 Bloomberg 代码转换为 Yahoo symbol 后查询；无法可靠映射的市场保留持仓并标记缺失。
 - sector 和 industry 使用 Nasdaq quote endpoint 补充。
-- ETF 收益和风险指标优先使用 Nasdaq chart 数据；组合风险用 ETF 价格曲线重新计算。
-- 默认不写缓存。加 `--cache` 后，持仓、成分股指标和 ETF 价格历史写入 `out-dir/cache`；加 `--refresh-cache` 可先清理旧缓存。
+- ETF 收益和风险指标优先使用 Yahoo adjusted chart，Nasdaq chart 和 AkShare 作为 fallback；组合风险用 ETF 价格曲线重新计算。
+- 默认不写缓存。加 `--cache` 后，持仓、成分股指标和 ETF 价格历史写入 `out-dir/cache`；缓存必须带匹配的 schema 版本，持仓与估值缓存最多复用 24 小时，行情缓存还要求末日距当前不超过 7 天。`--refresh-cache` 不依赖本次是否开启缓存写入。
 - `--lookback-days` 是 `--nav-lookback-days` 的别名。
 
 ## 指定 ETF 或组合穿透
@@ -108,7 +119,7 @@ python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,5131
 python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,513100,QQQ.US --markets a,hk,us,us_listed --weights 25,25,25,25 --out-dir selected-global-us-listed-output
 ```
 
-`--weights` 支持百分数或小数，并会自动归一化。未提供权重时等权。`--markets` 可传 `auto`、`hk`、`a`、`us`、`us_listed`；除非自动识别错误，否则使用 `auto`。以 `.US` 结尾的 ticker 会自动进入 `us_listed` 模式。
+`--weights` 支持百分数或小数，并会自动归一化；非有限数和重复 ETF 会直接拒绝。未提供权重时等权。`--markets` 可传 `auto`、`hk`、`a`、`us`、`us_listed`；`auto` 会合并成功解析出的 A/HK/US 成分，不得只选择单一市场。确认无适用成分不算失败，真实解析错误必须进入 ETF 的 `错误` 字段。以 `.US` 结尾的 ticker 会自动进入 `us_listed` 模式。
 
 ## 指定组合输出
 
@@ -152,14 +163,16 @@ python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,5131
 - PB：只对有效正 PB 成分做加权平均。
 - ETF 年化收益、波动率、Sortino、最大回撤、Sharpe、Calmar、VaR/CVaR、下行波动率：来自 ETF NAV 或价格历史。
 - 所有入口共用同一套收益/风险公式：风险窗口最多一年，MAR/无风险收益率为 0，年化交易日为 252。
-- 组合收益/风险：按初始权重买入并持有的组合曲线重新计算，不把单只 ETF 指标简单加权。
+- 组合收益/风险：按初始权重买入并持有的组合曲线重新计算，不把单只 ETF 指标简单加权；只使用全部 ETF 真实历史重叠的共同区间。
+- 行情、净值与汇率必须先归一到交易日期再对齐；不得把同一日的不同时间戳当成多条日收益。
 - 半年、一年、三年收益至少覆盖 150、330、900 个日历日；不足时留空。
 - 优先使用累计净值、前复权或 adjusted close；只能取得未复权价格时必须标记“价格收益(未计现金分红)”。
 - 自选跨市场组合以 CNY 为收益币种；直接美股上市 ETF 先乘历史 USD/CNY。美股专用脚本单独运行时以 USD 计价。
-- PE/PB/股息率约束默认要求对应覆盖权重至少 80%；不足时结果为“数据不足”，不得显示“通过”。
+- PE/PB/股息率约束默认要求对应覆盖权重至少 80%；任一 ETF 穿透失败或存在未定价成分时，股票、行业、市场和估值约束均为“数据不足”，不得显示“通过”。
 - 行业/主题：当前为规则估计，除非外部官方映射接入；输出会标注数据来源状态。
 - US ticker 保持 ticker 形态，不补零；例如 `AAPL`、`MSFT`、`NVDA`、`BRK.B`、`BRK-B`。
-- A 股上市美股成分 QDII 的 PE/PB/股息率是 AkShare best-effort；直接美股上市 ETF 成分股使用 Yahoo quoteSummary，并用 Nasdaq 补 sector/industry。
+- A 股上市美股成分 QDII 的 PE/PB/股息率是 AkShare best-effort；直接美股上市 ETF 及可映射的国际股票成分使用 Yahoo quoteSummary，美国股票再用 Nasdaq 补 sector/industry。
+- Yahoo 明确报告年度股息为零时记为 `0`；无法区分“无股息”和“来源缺失”时留空。PB 小于 `0.05` 或大于 `1000` 视为来源异常，不进入聚合。
 
 ## PCF 规则
 
@@ -187,13 +200,16 @@ python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,5131
 ## 失败规则与禁止事项
 
 - 如果部分 ETF 失败，最终表仍保留该 ETF，并写 `数据状态=失败` 和 `错误`；不得静默缩小排名样本。
-- 如果估值覆盖率低于 80%，保留数值供审计，但不得参与有效股息率排名或通过估值约束。
+- 全部 ETF 失败时仍要写核心 CSV、Excel 和 manifest，并返回非零退出码。
+- 股息率、PE、PB 任一指标为空或覆盖率低于 80%，保留数值供审计，但不得标记为“有效”、参与股息率排名或通过估值约束。
+- 多文件输出必须先在临时目录完整生成并校验，manifest 最后发布；替换失败时回滚已更新文件，避免新旧批次混合。
 - 不要把不足 900 天的收益标成近 3 年收益。
 - 不要用股票名称作为唯一持仓身份；始终按“底层市场 + 标准化股票代码”合并。
 - 不要把 PCF 申赎篮子表述成精确基金持仓。
 - 不要把规则行业标成官方申万/中信行业。
 - ETF-of-ETF、ETN、商品/加密信托和衍生品只报告当前层级及未穿透权重；不要声称已递归展开。
 - 默认清理只能删除脚本明确生成的中间文件，不得删除输出目录中的其他文件。
+- 输出先在临时目录生成并校验，manifest 最后发布；紧凑模式要删除上一轮由脚本生成的辅助输出，避免新旧运行混杂。
 
 ## 依赖
 

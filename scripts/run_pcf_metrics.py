@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pandas as pd
+
+from pcf_common import publish_staged_files
 
 
 FINAL_CSV = "pcf_full_metrics_table.csv"
@@ -17,17 +21,71 @@ DEFAULT_INPUT = "lookthrough-hk-all-ranking/all_etf_summary.csv"
 MIN_RANK_COVERAGE = 80.0
 
 
+def write_final_report(out_dir: Path, report: pd.DataFrame, *, format_hk: bool = False) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".pcf-final-stage-", dir=out_dir) as tmpdir:
+        stage = Path(tmpdir)
+        csv_path = stage / FINAL_CSV
+        xlsx_path = stage / FINAL_XLSX
+        report.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+            report.to_excel(writer, index=False, sheet_name="ETF穿透汇总")
+            if format_hk:
+                ws = writer.book["ETF穿透汇总"]
+                ws.freeze_panes = "A2"
+                widths = {
+                    "A": 12,
+                    "B": 12,
+                    "C": 24,
+                    "D": 14,
+                    "E": 14,
+                    "F": 14,
+                    "G": 12,
+                    "H": 10,
+                    "I": 10,
+                    "J": 12,
+                    "K": 12,
+                    "L": 12,
+                    "M": 12,
+                    "N": 12,
+                    "O": 12,
+                    "P": 16,
+                    "Q": 24,
+                    "R": 24,
+                    "S": 14,
+                    "T": 12,
+                }
+                for column, width in widths.items():
+                    ws.column_dimensions[column].width = width
+                for row in ws.iter_rows(min_row=2, min_col=6, max_col=15):
+                    for cell in row:
+                        cell.number_format = "0.00"
+        publish_staged_files(
+            [
+                (csv_path, out_dir / FINAL_CSV),
+                (xlsx_path, out_dir / FINAL_XLSX),
+            ]
+        )
+
+
 def column_or_default(df: pd.DataFrame, name: str, default=None) -> pd.Series:
     return df[name] if name in df.columns else pd.Series([default] * len(df), index=df.index)
+
+
+def normalize_etf_code(value: object) -> str:
+    match = re.fullmatch(r"(\d{1,6})(?:\.0)?", str(value).strip())
+    if not match:
+        raise ValueError(f"Invalid A-listed ETF code: {value!r}")
+    return match.group(1).zfill(6)
 
 
 def append_failed_rows(report: pd.DataFrame, expected_codes: list[str] | None, errors: dict[str, str]) -> pd.DataFrame:
     if not expected_codes:
         return report
-    completed = set(report["ETF代码"].astype(str).str.zfill(6)) if not report.empty else set()
+    completed = {normalize_etf_code(code) for code in report["ETF代码"]} if not report.empty else set()
     rows = []
     for code in expected_codes:
-        code = str(code).zfill(6)
+        code = normalize_etf_code(code)
         if code in completed:
             continue
         row = {column: None for column in report.columns}
@@ -36,7 +94,58 @@ def append_failed_rows(report: pd.DataFrame, expected_codes: list[str] | None, e
     return pd.concat([report, pd.DataFrame(rows)], ignore_index=True) if rows else report
 
 
-def parse_args() -> argparse.Namespace:
+def build_failure_report(codes: list[str], errors: dict[str, str], market: str, fallback: str) -> pd.DataFrame:
+    exposure_column = "美股持仓权重%" if market == "us" else "港股持仓权重%"
+    columns = [
+        "排名_按股息率",
+        "ETF代码",
+        "ETF名称",
+        "持仓期",
+        "持仓来源",
+        "穿透口径",
+        exposure_column,
+        "股息率%",
+        "股息率覆盖权重%",
+        "PE",
+        "PB",
+        "PB覆盖权重%",
+        "年化收益%",
+        "索提诺比率",
+        "波动率%",
+        "近半年收益%",
+        "近一年收益%",
+        "近3年收益%",
+        "收益来源",
+        "收益口径",
+        "收益币种",
+        "收益区间",
+        "风险指标区间",
+        "PE覆盖权重%",
+        "负PE权重%",
+        "PCF原始股票行数",
+        "有效权重行数",
+        "未定价/缺失权重行数",
+        "数据状态",
+        "错误",
+    ]
+    rows = []
+    for code in codes:
+        row = {column: None for column in columns}
+        row.update(
+            {
+                "ETF代码": normalize_etf_code(code),
+                "收益币种": "CNY",
+                "数据状态": "失败",
+                "错误": errors.get(normalize_etf_code(code), fallback),
+            }
+        )
+        rows.append(row)
+    report = pd.DataFrame(rows, columns=columns)
+    report["排名_按股息率"] = pd.Series([pd.NA] * len(report), dtype="Int64")
+    return report
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input",
@@ -52,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sleep", type=float, default=0.05, help="Sleep seconds between constituent valuation requests.")
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep per-ETF reports and summary files.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def load_codes(args: argparse.Namespace) -> list[str]:
@@ -73,11 +182,25 @@ def load_codes(args: argparse.Namespace) -> list[str]:
                 "workflow; for an explicit run use: python scripts/run_pcf_metrics.py --etf 513690,159569"
             )
         raise SystemExit(f"No ETF codes found. Provide --etf or a valid --input CSV: {input_path}")
-    return [code.zfill(6) for code in dict.fromkeys(codes)]
+    try:
+        return list(dict.fromkeys(normalize_etf_code(code) for code in codes))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def run_lookthrough(args: argparse.Namespace, codes: list[str], out_dir: Path) -> None:
     if args.market == "us":
+        unsupported = []
+        if args.holdings_source != "auto":
+            unsupported.append("--holdings-source")
+        if args.alt_limit != 0:
+            unsupported.append("--alt-limit")
+        if args.sleep != 0.05:
+            unsupported.append("--sleep")
+        if args.top_n != 20:
+            unsupported.append("--top-n")
+        if unsupported:
+            raise SystemExit(f"{', '.join(unsupported)} are only supported by --market hk.")
         script = Path(__file__).with_name("selected_etf_lookthrough.py")
         subprocess.run(
             [
@@ -118,7 +241,38 @@ def build_hk_final_tables(out_dir: Path, expected_codes: list[str] | None = None
     summary_path = out_dir / "summary.csv"
     if not summary_path.exists():
         raise SystemExit(f"Missing look-through summary: {summary_path}")
-    summary = pd.read_csv(summary_path, encoding="utf-8-sig")
+    try:
+        summary = pd.read_csv(summary_path, encoding="utf-8-sig")
+    except pd.errors.EmptyDataError:
+        summary = pd.DataFrame(
+            columns=[
+                "etf",
+                "name",
+                "holdings_period",
+                "holdings_source",
+                "hk_weight_pct",
+                "raw_hk_rows",
+                "effective_hk_rows",
+                "missing_weight_rows",
+                "dividend_yield_pct",
+                "dividend_yield_coverage_pct",
+                "pb",
+                "pb_coverage_pct",
+                "pe_earnings_yield",
+                "pe_coverage_pct",
+                "negative_pe_weight_pct",
+                "annualized_return_pct",
+                "sortino_ratio",
+                "volatility_pct",
+                "half_year_return_pct",
+                "one_year_return_pct",
+                "three_year_return_pct",
+                "annualized_return_source",
+                "return_basis",
+                "return_window",
+                "risk_window",
+            ]
+        )
     numeric_columns = [
         "hk_weight_pct",
         "dividend_yield_pct",
@@ -143,6 +297,10 @@ def build_hk_final_tables(out_dir: Path, expected_codes: list[str] | None = None
     summary["_rankable"] = (
         pd.to_numeric(column_or_default(summary, "dividend_yield_coverage_pct"), errors="coerce").ge(MIN_RANK_COVERAGE)
         & pd.to_numeric(summary["dividend_yield_pct"], errors="coerce").notna()
+        & pd.to_numeric(column_or_default(summary, "pe_coverage_pct"), errors="coerce").ge(MIN_RANK_COVERAGE)
+        & pd.to_numeric(summary["pe_earnings_yield"], errors="coerce").notna()
+        & pd.to_numeric(column_or_default(summary, "pb_coverage_pct"), errors="coerce").ge(MIN_RANK_COVERAGE)
+        & pd.to_numeric(summary["pb"], errors="coerce").notna()
     )
     summary = summary.sort_values(["_rankable", "dividend_yield_pct"], ascending=[False, False], na_position="last").reset_index(drop=True)
     ranks = pd.Series(pd.NA, index=summary.index, dtype="Int64")
@@ -188,38 +346,7 @@ def build_hk_final_tables(out_dir: Path, expected_codes: list[str] | None = None
         if {"etf", "error"}.issubset(error_df.columns):
             errors = {str(row["etf"]).zfill(6): str(row["error"]) for _, row in error_df.iterrows()}
     report = append_failed_rows(report, expected_codes, errors)
-    report.to_csv(out_dir / FINAL_CSV, index=False, encoding="utf-8-sig")
-    with pd.ExcelWriter(out_dir / FINAL_XLSX, engine="openpyxl") as writer:
-        report.to_excel(writer, index=False, sheet_name="ETF穿透汇总")
-        ws = writer.book["ETF穿透汇总"]
-        ws.freeze_panes = "A2"
-        widths = {
-            "A": 12,
-            "B": 12,
-            "C": 24,
-            "D": 14,
-            "E": 14,
-            "F": 14,
-            "G": 12,
-            "H": 10,
-            "I": 10,
-            "J": 12,
-            "K": 12,
-            "L": 12,
-            "M": 12,
-            "N": 12,
-            "O": 12,
-            "P": 16,
-            "Q": 24,
-            "R": 24,
-            "S": 14,
-            "T": 12,
-        }
-        for column, width in widths.items():
-            ws.column_dimensions[column].width = width
-        for row in ws.iter_rows(min_row=2, min_col=6, max_col=15):
-            for cell in row:
-                cell.number_format = "0.00"
+    write_final_report(out_dir, report, format_hk=True)
     return report
 
 
@@ -253,6 +380,10 @@ def build_us_final_tables(out_dir: Path, expected_codes: list[str] | None = None
         holding_errors.eq("")
         & pd.to_numeric(column_or_default(metrics, "股息率覆盖权重%"), errors="coerce").ge(MIN_RANK_COVERAGE)
         & pd.to_numeric(metrics["股息率%"], errors="coerce").notna()
+        & pd.to_numeric(column_or_default(metrics, "PE覆盖权重%"), errors="coerce").ge(MIN_RANK_COVERAGE)
+        & pd.to_numeric(metrics["PE"], errors="coerce").notna()
+        & pd.to_numeric(column_or_default(metrics, "PB覆盖权重%"), errors="coerce").ge(MIN_RANK_COVERAGE)
+        & pd.to_numeric(metrics["PB"], errors="coerce").notna()
     )
     metrics = metrics.sort_values(["_rankable", "股息率%"], ascending=[False, False], na_position="last").reset_index(drop=True)
     ranks = pd.Series(pd.NA, index=metrics.index, dtype="Int64")
@@ -284,6 +415,9 @@ def build_us_final_tables(out_dir: Path, expected_codes: list[str] | None = None
             "风险指标区间": metrics["风险指标区间"],
             "PE覆盖权重%": metrics["PE覆盖权重%"],
             "负PE权重%": metrics["负PE权重%"],
+            "PCF原始股票行数": column_or_default(metrics, "PCF原始股票行数"),
+            "有效权重行数": column_or_default(metrics, "有效权重行数"),
+            "未定价/缺失权重行数": column_or_default(metrics, "未定价/缺失权重行数"),
             "数据状态": ["有效" if rankable else ("失败" if error else "覆盖不足") for rankable, error in zip(metrics["_rankable"], column_or_default(metrics, "错误", "").fillna("").astype(str))],
             "错误": column_or_default(metrics, "错误", ""),
         }
@@ -294,9 +428,7 @@ def build_us_final_tables(out_dir: Path, expected_codes: list[str] | None = None
         if str(error or "")
     }
     report = append_failed_rows(report, expected_codes, errors)
-    report.to_csv(out_dir / FINAL_CSV, index=False, encoding="utf-8-sig")
-    with pd.ExcelWriter(out_dir / FINAL_XLSX, engine="openpyxl") as writer:
-        report.to_excel(writer, index=False, sheet_name="ETF穿透汇总")
+    write_final_report(out_dir, report)
     return report
 
 
@@ -306,7 +438,7 @@ def build_final_tables(out_dir: Path, market: str = "hk", expected_codes: list[s
     return build_hk_final_tables(out_dir, expected_codes)
 
 
-def clean_intermediates(out_dir: Path) -> None:
+def clean_intermediates(out_dir: Path, codes: list[str] | None = None) -> None:
     names = {
         "summary.csv", "summary.md", "errors.csv", "errors.md", "ranked_top5.csv", "ranked_top5.md",
         "metrics_summary.csv", "lookthrough_summary.csv", "lookthrough_detail.csv", "etf_summary.csv",
@@ -316,15 +448,22 @@ def clean_intermediates(out_dir: Path) -> None:
         "common_holdings.csv", "pcf_quality.csv", "cross_validation.csv", "constraint_checks.csv", "historical_tracking.csv",
     }
     paths = {out_dir / name for name in names}
-    for pattern in ("*_lookthrough.json", "*_lookthrough.md", "*_holdings.csv"):
-        paths.update(out_dir.glob(pattern))
+    for code in codes or []:
+        normalized = normalize_etf_code(code)
+        paths.update(
+            {
+                out_dir / f"{normalized}_lookthrough.json",
+                out_dir / f"{normalized}_lookthrough.md",
+                out_dir / f"{normalized}_holdings.csv",
+            }
+        )
     for path in paths:
         if path.is_file() and path.name not in {FINAL_CSV, FINAL_XLSX}:
             path.unlink()
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     codes = load_codes(args)
@@ -338,23 +477,23 @@ def main() -> int:
             error_df = pd.read_csv(error_path, encoding="utf-8-sig")
             if {"etf", "error"}.issubset(error_df.columns):
                 errors = {str(row["etf"]).zfill(6): str(row["error"]) for _, row in error_df.iterrows()}
-        report = pd.DataFrame(
-            {
-                "排名_按股息率": pd.Series([pd.NA] * len(codes), dtype="Int64"),
-                "ETF代码": codes,
-                "数据状态": "失败",
-                "错误": [errors.get(code, f"look-through process exited with code {exc.returncode}") for code in codes],
-            }
-        )
-        report.to_csv(out_dir / FINAL_CSV, index=False, encoding="utf-8-sig")
-        with pd.ExcelWriter(out_dir / FINAL_XLSX, engine="openpyxl") as writer:
-            report.to_excel(writer, index=False, sheet_name="ETF穿透汇总")
+        try:
+            report = build_final_tables(out_dir, args.market, codes)
+        except SystemExit:
+            report = build_failure_report(
+                codes,
+                errors,
+                args.market,
+                f"look-through process exited with code {exc.returncode}",
+            )
+            write_final_report(out_dir, report)
     if not args.keep_intermediates:
-        clean_intermediates(out_dir)
+        clean_intermediates(out_dir, codes)
     print(out_dir / FINAL_XLSX)
     print(out_dir / FINAL_CSV)
     print(f"rows={len(report)}")
-    return 0
+    failed = report.get("数据状态", pd.Series(dtype=str)).fillna("").astype(str).eq("失败")
+    return 1 if bool(failed.any()) else 0
 
 
 if __name__ == "__main__":

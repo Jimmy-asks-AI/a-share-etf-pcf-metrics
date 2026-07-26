@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import subprocess
 import sys
 import types
 import unittest
@@ -9,6 +10,7 @@ from argparse import Namespace
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import pandas as pd
 
@@ -179,12 +181,25 @@ class CoreBehaviourTests(unittest.TestCase):
             remove_json.write_text("json", encoding="utf-8")
             user_file.write_text("keep", encoding="utf-8")
 
-            self.runner.clean_intermediates(out_dir)
+            self.runner.clean_intermediates(out_dir, ["513690"])
 
             self.assertTrue(keep_csv.exists())
             self.assertTrue(keep_xlsx.exists())
             self.assertFalse(remove_json.exists())
             self.assertTrue(user_file.exists())
+
+    def test_clean_intermediates_does_not_delete_unrequested_holding_file(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            requested = out_dir / "513690_holdings.csv"
+            unrelated = out_dir / "manual_holdings.csv"
+            requested.write_text("generated", encoding="utf-8")
+            unrelated.write_text("user", encoding="utf-8")
+
+            self.runner.clean_intermediates(out_dir, ["513690"])
+
+            self.assertFalse(requested.exists())
+            self.assertTrue(unrelated.exists())
 
     def test_us_ticker_normalization_preserves_ticker_shape(self) -> None:
         self.assertEqual(self.us_metrics.normalize_us_ticker(" brk.b "), "BRK.B")
@@ -196,6 +211,19 @@ class CoreBehaviourTests(unittest.TestCase):
         self.assertEqual(self.selected.parse_modes("us", 2), ["us", "us"])
         self.assertEqual(self.selected.parse_modes("auto,a,hk,us,us_listed", 5), ["auto", "a", "hk", "us", "us_listed"])
         self.assertEqual(self.selected.selected_etfs("510880,QQQ.US", "60,40", None)[1].mode, "us_listed")
+        self.assertEqual(self.selected.normalize_etf_code("510880.0"), "510880")
+        with self.assertRaises(ValueError):
+            self.selected.normalize_etf_code("bad510880")
+        with self.assertRaises(ValueError):
+            self.selected.normalize_etf_code("QQQ!.US")
+        with self.assertRaises(ValueError):
+            self.selected.selected_etfs("510880,510880", "50,50", None)
+        with self.assertRaises(ValueError):
+            self.selected.parse_weights("nan,1", 2)
+
+    def test_batch_code_loader_normalizes_csv_style_float_codes(self) -> None:
+        args = Namespace(etf=["513690.0,159569"], input="unused.csv", code_column="ETF代码")
+        self.assertEqual(self.runner.load_codes(args), ["513690", "159569"])
 
     def test_selected_can_adapt_us_listed_holdings(self) -> None:
         fake = types.SimpleNamespace(
@@ -316,12 +344,127 @@ class CoreBehaviourTests(unittest.TestCase):
         self.assertIsNone(metrics["one_year_return_pct"])
         self.assertIsNone(metrics["three_year_return_pct"])
 
+    def test_combined_price_series_stops_at_earliest_last_observation(self) -> None:
+        short_dates = pd.date_range("2026-01-01", periods=5, freq="D")
+        long_dates = pd.date_range("2026-01-01", periods=10, freq="D")
+        combined = self.common.combine_price_series(
+            {
+                "A": pd.Series(range(100, 105), index=short_dates, dtype=float),
+                "B": pd.Series(range(200, 210), index=long_dates, dtype=float),
+            },
+            {"A": 0.5, "B": 0.5},
+        )
+        self.assertEqual(combined.index[-1], short_dates[-1])
+        self.assertTrue(self.common.combine_price_series({"A": pd.Series([1.0], index=short_dates[:1])}, {"A": 0.5, "B": 0.5}).empty)
+
+    def test_incomplete_lookthrough_cannot_pass_structural_or_valuation_constraints(self) -> None:
+        detail = pd.DataFrame(
+            [{self.enhanced.C_ETF_CODE: "A", self.enhanced.C_MARKET: "US", self.enhanced.C_STOCK_CODE: "X", self.enhanced.C_STOCK_NAME: "X", self.enhanced.C_ETF_INNER_WEIGHT: 5.0, self.enhanced.C_PORTFOLIO_WEIGHT: 5.0}]
+        )
+        metrics = pd.DataFrame(
+            [{self.enhanced.C_ETF_CODE: "PORTFOLIO", "PE": 8.0, "PE覆盖权重%": 100.0, "错误": '{"B":"holdings failed"}'}]
+        )
+        checks = self.enhanced.build_constraint_checks(
+            detail,
+            metrics,
+            pd.DataFrame(),
+            self.enhanced.ConstraintConfig(max_stock_weight=7, max_pe=10),
+        )
+        self.assertEqual(checks.loc[checks["约束"].eq("单一股票权重上限"), "结果"].iloc[0], "数据不足")
+        self.assertEqual(checks.loc[checks["约束"].eq("最高PE"), "结果"].iloc[0], "数据不足")
+
+    def test_skip_metrics_still_preserves_portfolio_holding_errors(self) -> None:
+        detail = pd.DataFrame(
+            [
+                {
+                    self.selected.C_ETF_CODE: "510001",
+                    self.selected.C_ETF_NAME: "A",
+                    self.selected.C_ETF_WEIGHT: 50.0,
+                    self.selected.C_UNDERLYING_MARKET: "A",
+                    self.selected.C_STOCK_CODE: "600000",
+                    self.selected.C_STOCK_NAME: "浦发银行",
+                    self.selected.C_ETF_INNER_WEIGHT: 10.0,
+                    self.selected.C_PORTFOLIO_WEIGHT: 5.0,
+                    self.selected.C_PERIOD: "fixture",
+                    self.selected.C_SOURCE: "fixture",
+                }
+            ]
+        )
+        etf_summary = pd.DataFrame(
+            [
+                {self.selected.C_ETF_CODE: "510001", self.selected.C_ETF_WEIGHT: 50.0, self.selected.C_ERROR: "", self.selected.C_RAW_STOCK_ROWS: 1, self.selected.C_EFFECTIVE_STOCK_ROWS: 1, self.selected.C_MISSING_WEIGHT_ROWS: 0},
+                {self.selected.C_ETF_CODE: "510002", self.selected.C_ETF_WEIGHT: 50.0, self.selected.C_ERROR: "fixture failure", self.selected.C_RAW_STOCK_ROWS: 0, self.selected.C_EFFECTIVE_STOCK_ROWS: 0, self.selected.C_MISSING_WEIGHT_ROWS: 0},
+            ]
+        )
+        _, _, _, metrics = self.selected.add_metrics_to_tables(
+            [self.selected.SelectedETF("510001", 0.5, "a"), self.selected.SelectedETF("510002", 0.5, "a")],
+            pd.DataFrame(),
+            detail,
+            etf_summary,
+            object(),
+            object(),
+            object(),
+            None,
+            1,
+            0,
+            0.0,
+            365,
+            skip_metrics=True,
+        )
+        portfolio = metrics[metrics[self.selected.C_ETF_CODE].eq("PORTFOLIO")].iloc[0]
+        self.assertIn("510002", portfolio[self.selected.C_ERROR])
+        self.assertEqual(portfolio[self.selected.C_RAW_STOCK_ROWS], 1)
+
+    def test_a_share_dividend_output_retains_failures_and_gates_rank(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            candidates = pd.DataFrame(
+                [{"ETF代码": "510001", "ETF名称": "低覆盖红利"}, {"ETF代码": "510002", "ETF名称": "失败红利"}]
+            )
+            report = pd.DataFrame(
+                [{"ETF代码": "510001", "ETF名称": "低覆盖红利", "股息率%": 6.0, "股息率覆盖权重%": 50.0}]
+            )
+            self.a_metrics.write_outputs(
+                Path(tmpdir),
+                report,
+                candidates,
+                [{"ETF代码": "510002", "ETF名称": "失败红利", "说明": "fixture failure"}],
+            )
+            output = pd.read_csv(Path(tmpdir) / "a_share_dividend_etf_pcf_metrics.csv", encoding="utf-8-sig")
+
+        self.assertEqual(len(output), 2)
+        self.assertTrue(output["排名_按股息率"].isna().all())
+        self.assertEqual(output.loc[output["ETF代码"].eq(510001), "数据状态"].iloc[0], "覆盖不足")
+        self.assertEqual(output.loc[output["ETF代码"].eq(510002), "数据状态"].iloc[0], "失败")
+
     def test_batch_failure_rows_are_retained(self) -> None:
         report = pd.DataFrame([{"ETF代码": "513690", "数据状态": "有效", "错误": ""}])
         result = self.runner.append_failed_rows(report, ["513690", "159569"], {"159569": "fixture failure"})
         failed = result[result["ETF代码"].eq("159569")].iloc[0]
         self.assertEqual(failed["数据状态"], "失败")
         self.assertEqual(failed["错误"], "fixture failure")
+
+    def test_batch_all_failure_report_has_full_schema(self) -> None:
+        report = self.runner.build_failure_report(
+            ["513690"],
+            {"513690": "fixture failure"},
+            "hk",
+            "fallback",
+        )
+        self.assertEqual(report.iloc[0]["数据状态"], "失败")
+        self.assertEqual(report.iloc[0]["错误"], "fixture failure")
+        for column in ["股息率%", "PE", "PB", "年化收益%", "PCF原始股票行数"]:
+            self.assertIn(column, report.columns)
+
+    def test_batch_us_rejects_hk_only_options(self) -> None:
+        args = Namespace(
+            market="us",
+            holdings_source="reported",
+            alt_limit=0,
+            sleep=0.05,
+            top_n=20,
+        )
+        with self.assertRaises(SystemExit):
+            self.runner.run_lookthrough(args, ["513100"], Path("unused"))
 
     def test_pcf_quality_uses_pre_filter_missing_row_count(self) -> None:
         detail = pd.DataFrame(
@@ -441,26 +584,99 @@ class CoreBehaviourTests(unittest.TestCase):
         self.assertAlmostEqual(df.iloc[0]["\u6743\u91cd%"], 14.0)
         self.assertEqual(df.iloc[0]["\u6743\u91cd\u6765\u6e90"], "ComponentShare*US latest price*USD/CNY/NAVperCU")
 
-    def test_auto_mode_can_choose_us_best_weight(self) -> None:
+    def test_auto_mode_merges_all_resolved_markets(self) -> None:
         key = "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%"
 
-        def fake_result(mode, weight):
-            return pd.DataFrame({"x": [1]}), {key: weight, self.selected.C_MODE: mode}
+        def fake_result(mode, market, code, weight):
+            return (
+                pd.DataFrame(
+                    [
+                        {
+                            self.selected.C_MARKET: market,
+                            self.selected.C_STOCK_CODE: code,
+                            self.selected.C_ETF_INNER_WEIGHT: weight,
+                        }
+                    ]
+                ),
+                {
+                    key: weight,
+                    self.selected.C_MODE: mode,
+                    self.selected.C_PERIOD: "fixture",
+                    self.selected.C_SOURCE: f"fixture_{mode}",
+                    self.selected.C_STOCK_COUNT: 1,
+                },
+            )
 
         old_hk = self.selected.get_hk_stock_holdings
         old_a = self.selected.get_a_stock_holdings
         old_us = self.selected.get_us_stock_holdings
         try:
-            self.selected.get_hk_stock_holdings = lambda module, etf: fake_result("hk", 20)
-            self.selected.get_a_stock_holdings = lambda module, etf: fake_result("a", 50)
-            self.selected.get_us_stock_holdings = lambda module, etf: fake_result("us", 90)
+            self.selected.get_hk_stock_holdings = lambda module, etf: fake_result("hk", "HK", "00005", 20)
+            self.selected.get_a_stock_holdings = lambda module, etf: fake_result("a", "A", "600000", 50)
+            self.selected.get_us_stock_holdings = lambda module, etf: fake_result("us", "US", "AAPL", 30)
             _, meta = self.selected.resolve_holdings(self.selected.SelectedETF("513100", 1.0, "auto"), object(), object(), object(), 30)
         finally:
             self.selected.get_hk_stock_holdings = old_hk
             self.selected.get_a_stock_holdings = old_a
             self.selected.get_us_stock_holdings = old_us
 
-        self.assertEqual(meta[self.selected.C_MODE], "us")
+        self.assertEqual(meta[self.selected.C_MODE], "auto")
+        self.assertEqual(meta[self.selected.C_STOCK_COUNT], 3)
+        self.assertAlmostEqual(meta[key], 100.0)
+
+    def test_auto_mode_retains_real_parser_failures_in_audit_output(self) -> None:
+        key = "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%"
+        a_frame = pd.DataFrame(
+            [
+                {
+                    self.selected.C_MARKET: "A",
+                    self.selected.C_STOCK_CODE: "600000",
+                    self.selected.C_STOCK_NAME: "Fixture",
+                    self.selected.C_ETF_INNER_WEIGHT: 50.0,
+                    self.selected.C_STOCK_PRICE: 10.0,
+                    self.selected.C_WEIGHT_SOURCE: "fixture",
+                    self.selected.C_DETAIL_SOURCE: "",
+                    self.selected.C_VALUATION_ERROR: "",
+                }
+            ]
+        )
+        a_meta = {
+            key: 50.0,
+            self.selected.C_MODE: "a",
+            self.selected.C_PERIOD: "fixture",
+            self.selected.C_SOURCE: "fixture_a",
+            self.selected.C_STOCK_COUNT: 1,
+        }
+        with (
+            mock.patch.object(
+                self.selected,
+                "get_hk_stock_holdings",
+                side_effect=RuntimeError("fixture HK transport failure"),
+            ),
+            mock.patch.object(
+                self.selected,
+                "get_a_stock_holdings",
+                return_value=(a_frame, a_meta),
+            ),
+            mock.patch.object(
+                self.selected,
+                "get_us_stock_holdings",
+                side_effect=self.selected.NoApplicableHoldings("no US rows"),
+            ),
+        ):
+            _, _, etf_summary = self.selected.build_tables(
+                [self.selected.SelectedETF("510001", 1.0, "auto")],
+                object(),
+                object(),
+                object(),
+                None,
+                {},
+                30.0,
+            )
+
+        error = etf_summary.iloc[0][self.selected.C_ERROR]
+        self.assertIn("auto mode incomplete", error)
+        self.assertIn("fixture HK transport failure", error)
 
     def test_constraint_checks_include_target_us_weight(self) -> None:
         detail = pd.DataFrame(
@@ -507,6 +723,8 @@ class CoreBehaviourTests(unittest.TestCase):
                         "\u6536\u76ca\u533a\u95f4": "window",
                         "\u98ce\u9669\u6307\u6807\u533a\u95f4": "risk",
                         "PE\u8986\u76d6\u6743\u91cd%": 90,
+                        "\u80a1\u606f\u7387\u8986\u76d6\u6743\u91cd%": 90,
+                        "PB\u8986\u76d6\u6743\u91cd%": 90,
                         "\u8d1fPE\u6743\u91cd%": 0,
                     },
                     {"ETF\u4ee3\u7801": "PORTFOLIO"},
@@ -520,6 +738,434 @@ class CoreBehaviourTests(unittest.TestCase):
             self.assertTrue((out_dir / self.runner.FINAL_XLSX).exists())
             self.assertEqual(report.iloc[0]["ETF\u4ee3\u7801"], "513100")
             self.assertAlmostEqual(report.iloc[0]["\u7f8e\u80a1\u6301\u4ed3\u6743\u91cd%"], 98.5)
+            self.assertEqual(report.iloc[0]["数据状态"], "有效")
+
+    def test_final_table_requires_pe_and_pb_before_marking_row_valid(self) -> None:
+        result = {
+            "etf": "513100",
+            "name": "Fixture",
+            "holdings_period": "fixture",
+            "holdings_source": "fixture",
+            "summary": {
+                "total_hk_weight_pct": 100.0,
+                "raw_hk_rows": 1,
+                "effective_hk_rows": 1,
+                "missing_weight_rows": 0,
+                "dividend_yield_pct": 5.0,
+                "pb": None,
+                "pe_simple": 10.0,
+                "pe_positive_simple": 10.0,
+                "pe_earnings_yield": 10.0,
+                "coverage": {
+                    "dividend_yield_weight_pct": 100.0,
+                    "pb_weight_pct": 0.0,
+                    "pe_earnings_yield_weight_pct": 100.0,
+                    "negative_pe_weight_pct": 0.0,
+                },
+            },
+            "returns": {},
+        }
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            self.hk_metrics.write_summary([result], out_dir)
+            report = self.runner.build_hk_final_tables(out_dir, ["513100"])
+
+        self.assertEqual(report.iloc[0]["数据状态"], "覆盖不足")
+        self.assertTrue(pd.isna(report.iloc[0]["排名_按股息率"]))
+
+    def test_hk_empty_summary_becomes_auditable_failure_table(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            self.hk_metrics.write_summary([], out_dir)
+            pd.DataFrame(
+                [{"etf": "513100", "error": "fixture holdings failure"}]
+            ).to_csv(out_dir / "errors.csv", index=False, encoding="utf-8-sig")
+
+            report = self.runner.build_hk_final_tables(out_dir, ["513100"])
+
+            self.assertEqual(report.iloc[0]["数据状态"], "失败")
+            self.assertEqual(report.iloc[0]["错误"], "fixture holdings failure")
+            self.assertTrue((out_dir / self.runner.FINAL_XLSX).is_file())
+
+    def test_a_share_main_returns_nonzero_when_every_candidate_fails(self) -> None:
+        candidates = pd.DataFrame([{"ETF代码": "510001", "ETF名称": "Fixture"}])
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            with (
+                mock.patch.object(self.a_metrics, "load_etf_candidates", return_value=candidates),
+                mock.patch.object(
+                    self.a_metrics,
+                    "get_pcf_holdings",
+                    side_effect=RuntimeError("fixture PCF failure"),
+                ),
+                mock.patch.object(self.a_metrics, "enrich_stock_metrics", return_value={}),
+                redirect_stdout(io.StringIO()),
+            ):
+                exit_code = self.a_metrics.main(
+                    ["--out-dir", str(out_dir), "--sleep", "0"]
+                )
+
+            report = pd.read_csv(
+                out_dir / "a_share_dividend_etf_pcf_metrics.csv",
+                encoding="utf-8-sig",
+            )
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(report.iloc[0]["数据状态"], "失败")
+            self.assertIn("fixture PCF failure", report.iloc[0]["错误"])
+
+    def test_publication_failure_rolls_back_all_previous_files(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            stage = root / "stage"
+            stage.mkdir()
+            old_a = root / "a.csv"
+            old_b = root / "b.xlsx"
+            old_manifest = root / "run_manifest.json"
+            old_a.write_text("old-a", encoding="utf-8")
+            old_b.write_text("old-b", encoding="utf-8")
+            old_manifest.write_text("old-manifest", encoding="utf-8")
+            new_a = stage / "a.csv"
+            new_b = stage / "b.xlsx"
+            new_manifest = stage / "run_manifest.json"
+            new_a.write_text("new-a", encoding="utf-8")
+            new_b.write_text("new-b", encoding="utf-8")
+            new_manifest.write_text("new-manifest", encoding="utf-8")
+            real_replace = self.common._replace_file
+
+            def fail_second_publication(source: Path, target: Path) -> None:
+                if source == new_b:
+                    raise PermissionError("fixture locked workbook")
+                real_replace(source, target)
+
+            with (
+                mock.patch.object(
+                    self.common,
+                    "_replace_file",
+                    side_effect=fail_second_publication,
+                ),
+                self.assertRaisesRegex(PermissionError, "fixture locked workbook"),
+            ):
+                self.common.publish_staged_files(
+                    [(new_a, old_a), (new_b, old_b)],
+                    commit_file=(new_manifest, old_manifest),
+                )
+
+            self.assertEqual(old_a.read_text(encoding="utf-8"), "old-a")
+            self.assertEqual(old_b.read_text(encoding="utf-8"), "old-b")
+            self.assertEqual(old_manifest.read_text(encoding="utf-8"), "old-manifest")
+
+
+    def test_shared_return_metrics_accept_minimum_documented_windows(self) -> None:
+        half_year_dates = pd.date_range("2025-01-01", periods=161, freq="D")
+        one_year_dates = pd.date_range("2025-01-01", periods=341, freq="D")
+        three_year_dates = pd.date_range("2023-01-01", periods=951, freq="D")
+
+        self.assertIsNotNone(
+            self.common.price_series_metrics(pd.Series(range(100, 261), index=half_year_dates, dtype=float))[
+                "half_year_return_pct"
+            ]
+        )
+        self.assertIsNotNone(
+            self.common.price_series_metrics(pd.Series(range(100, 441), index=one_year_dates, dtype=float))[
+                "one_year_return_pct"
+            ]
+        )
+        self.assertIsNotNone(
+            self.common.price_series_metrics(pd.Series(range(100, 1051), index=three_year_dates, dtype=float))[
+                "three_year_return_pct"
+            ]
+        )
+
+    def test_combined_price_series_aligns_same_calendar_day(self) -> None:
+        dates = pd.date_range("2026-01-01", periods=40, freq="D")
+        combined = self.common.combine_price_series(
+            {
+                "ETF": pd.Series(range(100, 140), index=dates + pd.Timedelta(hours=13, minutes=30), dtype=float),
+                "FX": pd.Series(7.0, index=dates + pd.Timedelta(hours=23), dtype=float),
+            },
+            {"ETF": 0.5, "FX": 0.5},
+        )
+        self.assertEqual(len(combined), 40)
+        self.assertTrue(all(timestamp.time().isoformat() == "00:00:00" for timestamp in combined.index))
+
+    def test_a_share_pcf_retains_unresolved_legal_stock_rows(self) -> None:
+        def fake_sse_query(etf, sql):
+            if sql == self.a_metrics.SSE_ETF_BASIC_SQL:
+                return {"result": [{"NAVPERCU": "1000", "TRADING_DAY": "20260725"}]}
+            return {
+                "result": [
+                    {
+                        "INSTRUMENT_ID": "600000",
+                        "INSTRUMENT_NAME": "浦发银行",
+                        "UNDERLYION_SECURITY_ID": "101",
+                        "SUBSTITUTION_CASH_AMOUNT": "",
+                        "QUANTITY": "0",
+                    }
+                ]
+            }
+
+        old_query = self.a_metrics.query_sse_pcf
+        try:
+            self.a_metrics.query_sse_pcf = fake_sse_query
+            frame, _ = self.a_metrics.get_sse_pcf_holdings("510001")
+        finally:
+            self.a_metrics.query_sse_pcf = old_query
+
+        self.assertEqual(len(frame), 1)
+        self.assertTrue(pd.isna(frame.iloc[0]["权重%"]))
+        self.assertEqual(frame.iloc[0]["权重来源"], "unresolved PCF component")
+
+    def test_szse_pcf_retains_unresolved_legal_stock_rows(self) -> None:
+        xml = """<Root>
+        <NAVperCU>1000</NAVperCU><TradingDay>20260725</TradingDay>
+        <Component>
+          <UnderlyingSecurityIDSource>102</UnderlyingSecurityIDSource>
+          <UnderlyingSecurityID>000001</UnderlyingSecurityID>
+          <UnderlyingSymbol>平安银行</UnderlyingSymbol>
+          <ComponentShare>0</ComponentShare>
+          <CreationCashSubstitute>0</CreationCashSubstitute>
+          <PremiumRatio>0</PremiumRatio>
+        </Component>
+        </Root>"""
+        old_fetch = self.a_metrics.fetch_szse_pcf_xml
+        try:
+            self.a_metrics.fetch_szse_pcf_xml = lambda etf: (xml, "fixture.xml")
+            frame, _ = self.a_metrics.get_szse_pcf_holdings("159001", {})
+        finally:
+            self.a_metrics.fetch_szse_pcf_xml = old_fetch
+
+        self.assertEqual(len(frame), 1)
+        self.assertTrue(pd.isna(frame.iloc[0]["权重%"]))
+        self.assertEqual(frame.iloc[0]["权重来源"], "unresolved PCF component")
+
+    def test_hk_dividend_rank_excludes_low_coverage_rows(self) -> None:
+        def result(etf, dividend, coverage):
+            return {
+                "etf": etf,
+                "name": etf,
+                "holdings_period": "fixture",
+                "holdings_source": "fixture",
+                "summary": {
+                    "total_hk_weight_pct": 100.0,
+                    "raw_hk_rows": 1,
+                    "effective_hk_rows": 1,
+                    "missing_weight_rows": 0,
+                    "dividend_yield_pct": dividend,
+                    "pb": 1.0,
+                    "pe_simple": 10.0,
+                    "pe_positive_simple": 10.0,
+                    "pe_earnings_yield": 10.0,
+                    "coverage": {
+                        "dividend_yield_weight_pct": coverage,
+                        "pb_weight_pct": 100.0,
+                        "pe_earnings_yield_weight_pct": 100.0,
+                        "negative_pe_weight_pct": 0.0,
+                    },
+                },
+                "returns": {},
+            }
+
+        with TemporaryDirectory() as tmpdir:
+            self.hk_metrics.write_summary(
+                [result("LOW", 9.0, 50.0), result("GOOD", 5.0, 90.0)],
+                Path(tmpdir),
+                rank_by_dividend=True,
+                top=5,
+            )
+            ranked = pd.read_csv(Path(tmpdir) / "ranked_top5.csv", encoding="utf-8-sig")
+
+        self.assertEqual(ranked["etf"].tolist(), ["GOOD"])
+
+    def test_selected_short_us_ticker_is_not_zero_filled(self) -> None:
+        detail = pd.DataFrame(
+            [
+                {
+                    self.selected.C_ETF_CODE: "VO.US",
+                    self.selected.C_STOCK_CODE: "AAPL",
+                    self.selected.C_STOCK_NAME: "Apple",
+                    self.selected.C_UNDERLYING_MARKET: "US",
+                    self.selected.C_ETF_INNER_WEIGHT: 10.0,
+                    self.selected.C_PORTFOLIO_WEIGHT: 10.0,
+                }
+            ]
+        )
+        etf_summary = pd.DataFrame(
+            [
+                {
+                    self.selected.C_ETF_CODE: "VO.US",
+                    self.selected.C_ETF_WEIGHT: 100.0,
+                    self.selected.C_MODE: "us_listed",
+                    self.selected.C_ERROR: "",
+                }
+            ]
+        )
+        _, _, _, metrics = self.selected.add_metrics_to_tables(
+            [self.selected.SelectedETF("VO.US", 1.0, "us_listed")],
+            pd.DataFrame(),
+            detail,
+            etf_summary,
+            object(),
+            object(),
+            object(),
+            None,
+            1,
+            0,
+            0.0,
+            365,
+            skip_metrics=True,
+        )
+        self.assertIn("VO.US", metrics[self.selected.C_ETF_CODE].tolist())
+        self.assertNotIn("0VO.US", metrics[self.selected.C_ETF_CODE].tolist())
+
+    def test_selected_all_failed_run_writes_auditable_core_outputs(self) -> None:
+        etf_summary = pd.DataFrame(
+            [
+                {
+                    self.selected.C_ETF_CODE: "510001",
+                    self.selected.C_ETF_NAME: "Fixture",
+                    self.selected.C_ETF_WEIGHT: 100.0,
+                    self.selected.C_MODE: "a",
+                    self.selected.C_STOCK_COUNT: 0,
+                    self.selected.C_RAW_STOCK_ROWS: 0,
+                    self.selected.C_EFFECTIVE_STOCK_ROWS: 0,
+                    self.selected.C_MISSING_WEIGHT_ROWS: 0,
+                    self.selected.C_ERROR: "fixture failure",
+                }
+            ]
+        )
+        summary, detail, etf_summary, metrics = self.selected.add_metrics_to_tables(
+            [self.selected.SelectedETF("510001", 1.0, "a")],
+            pd.DataFrame(),
+            pd.DataFrame(),
+            etf_summary,
+            object(),
+            object(),
+            object(),
+            None,
+            1,
+            0,
+            0.0,
+            365,
+            skip_metrics=True,
+        )
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            stale = out_dir / self.selected.OUT_HTML
+            stale.write_text("old", encoding="utf-8")
+            args = self.selected.build_parser().parse_args(
+                ["--etf", "510001", "--skip-metrics", "--out-dir", str(out_dir)]
+            )
+            self.selected.write_outputs(out_dir, summary, detail, etf_summary, metrics, args)
+
+            self.assertTrue((out_dir / self.selected.OUT_XLSX).exists())
+            self.assertTrue((out_dir / "run_manifest.json").exists())
+            self.assertFalse(stale.exists())
+            metric_rows = pd.read_csv(out_dir / self.selected.OUT_METRICS, encoding="utf-8-sig")
+
+        self.assertIn("510001", metric_rows[self.selected.C_ETF_CODE].astype(str).str.zfill(6).tolist())
+        self.assertIn("PORTFOLIO", metric_rows[self.selected.C_ETF_CODE].astype(str).tolist())
+
+    def test_run_pcf_metrics_main_returns_failure_and_writes_final_tables(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            with (
+                mock.patch.object(
+                    self.runner,
+                    "run_lookthrough",
+                    side_effect=subprocess.CalledProcessError(9, ["fixture"]),
+                ),
+                mock.patch.object(self.runner, "build_final_tables", side_effect=SystemExit("missing")),
+                redirect_stdout(io.StringIO()),
+            ):
+                exit_code = self.runner.main(
+                    ["--etf", "510001", "--out-dir", str(out_dir)]
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertTrue((out_dir / self.runner.FINAL_CSV).is_file())
+            self.assertTrue((out_dir / self.runner.FINAL_XLSX).is_file())
+            report = pd.read_csv(out_dir / self.runner.FINAL_CSV, encoding="utf-8-sig")
+            self.assertEqual(report.loc[0, "数据状态"], "失败")
+            self.assertIn("code 9", report.loc[0, "错误"])
+
+    def test_selected_main_all_failure_returns_nonzero_with_core_outputs(self) -> None:
+        etf_summary = pd.DataFrame(
+            [
+                {
+                    self.selected.C_ETF_CODE: "510001",
+                    self.selected.C_ETF_NAME: "Fixture",
+                    self.selected.C_ETF_WEIGHT: 100.0,
+                    self.selected.C_MODE: "a",
+                    self.selected.C_STOCK_COUNT: 0,
+                    self.selected.C_RAW_STOCK_ROWS: 0,
+                    self.selected.C_EFFECTIVE_STOCK_ROWS: 0,
+                    self.selected.C_MISSING_WEIGHT_ROWS: 0,
+                    self.selected.C_ERROR: "fixture failure",
+                }
+            ]
+        )
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            with (
+                mock.patch.object(self.selected, "import_module", return_value=object()),
+                mock.patch.object(self.selected, "maybe_load_name_map", return_value={}),
+                mock.patch.object(
+                    self.selected,
+                    "build_tables",
+                    return_value=(pd.DataFrame(), pd.DataFrame(), etf_summary),
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                exit_code = self.selected.main(
+                    [
+                        "--etf",
+                        "510001",
+                        "--markets",
+                        "a",
+                        "--skip-metrics",
+                        "--out-dir",
+                        str(out_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertTrue((out_dir / self.selected.OUT_XLSX).is_file())
+            self.assertTrue((out_dir / "run_manifest.json").is_file())
+
+    def test_selected_staging_failure_preserves_previous_outputs(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            old_summary = out_dir / self.selected.OUT_SUMMARY
+            old_manifest = out_dir / "run_manifest.json"
+            old_summary.write_text("old-summary", encoding="utf-8")
+            old_manifest.write_text("old-manifest", encoding="utf-8")
+            args = self.selected.build_parser().parse_args(
+                ["--etf", "510001", "--skip-metrics", "--out-dir", str(out_dir)]
+            )
+
+            def fail_after_partial_stage(stage: Path, *unused) -> None:
+                (stage / self.selected.OUT_SUMMARY).write_text("new-summary", encoding="utf-8")
+                raise RuntimeError("fixture staging failure")
+
+            with (
+                mock.patch.object(
+                    self.selected,
+                    "_write_outputs_direct",
+                    side_effect=fail_after_partial_stage,
+                ),
+                self.assertRaisesRegex(RuntimeError, "fixture staging failure"),
+            ):
+                self.selected.write_outputs(
+                    out_dir,
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    args,
+                )
+
+            self.assertEqual(old_summary.read_text(encoding="utf-8"), "old-summary")
+            self.assertEqual(old_manifest.read_text(encoding="utf-8"), "old-manifest")
 
 
 if __name__ == "__main__":

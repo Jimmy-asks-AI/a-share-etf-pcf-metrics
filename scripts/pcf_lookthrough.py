@@ -54,6 +54,7 @@ DEFAULT_DIVIDEND_CANDIDATES = [
     "513910",
 ]
 TRADING_DAYS_PER_YEAR = 252
+MIN_RANK_COVERAGE = 80.0
 PRIMARY_VALUATION_CACHE: dict[str, dict[str, float | None]] = {}
 ALT_VALUATION_CACHE: dict[str, dict[str, Any]] = {}
 HK_SPOT_PRICE_CACHE: dict[str, float] | None = None
@@ -1000,11 +1001,15 @@ def write_summary(results: list[dict[str, Any]], out_dir: Path, rank_by_dividend
     rows = []
     ordered = list(results)
     if rank_by_dividend:
+        ordered = [
+            item
+            for item in ordered
+            if clean_float(item["summary"].get("dividend_yield_pct")) is not None
+            and (clean_float(item["summary"].get("coverage", {}).get("dividend_yield_weight_pct")) or 0.0)
+            >= MIN_RANK_COVERAGE
+        ]
         ordered.sort(
-            key=lambda item: (
-                item["summary"].get("dividend_yield_pct") is not None,
-                item["summary"].get("dividend_yield_pct") or -1,
-            ),
+            key=lambda item: clean_float(item["summary"].get("dividend_yield_pct")) or -1,
             reverse=True,
         )
     if top is not None:
@@ -1044,7 +1049,38 @@ def write_summary(results: list[dict[str, Any]], out_dir: Path, rank_by_dividend
                 "return_window": f"{r.get('first_date')} to {r.get('last_date')}" if "error" not in r else r.get("error"),
             }
         )
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "etf",
+            "name",
+            "holdings_period",
+            "holdings_source",
+            "hk_weight_pct",
+            "raw_hk_rows",
+            "effective_hk_rows",
+            "missing_weight_rows",
+            "dividend_yield_pct",
+            "dividend_yield_coverage_pct",
+            "pb",
+            "pb_coverage_pct",
+            "pe_simple",
+            "pe_positive",
+            "pe_earnings_yield",
+            "pe_coverage_pct",
+            "negative_pe_weight_pct",
+            "annualized_return_source",
+            "return_basis",
+            "annualized_return_pct",
+            "sortino_ratio",
+            "volatility_pct",
+            "half_year_return_pct",
+            "one_year_return_pct",
+            "three_year_return_pct",
+            "risk_window",
+            "return_window",
+        ],
+    )
     csv_name = "ranked_top5.csv" if rank_by_dividend else "summary.csv"
     md_name = "ranked_top5.md" if rank_by_dividend else "summary.md"
     df.to_csv(out_dir / csv_name, index=False, encoding="utf-8-sig")

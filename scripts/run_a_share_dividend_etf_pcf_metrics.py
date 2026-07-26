@@ -16,6 +16,7 @@ import html
 import json
 import math
 import re
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
@@ -31,6 +32,7 @@ from pcf_common import (
     earnings_yield_pe as common_earnings_yield_pe,
     normalize_price_frame as common_normalize_price_frame,
     price_series_metrics,
+    publish_staged_files,
     weighted_average as common_weighted_average,
 )
 
@@ -54,6 +56,7 @@ SZSE_MARKET_MAP = {"101": "SSE", "102": "SZSE", "106": "BSE", "103": "HK"}
 A_MARKETS = {"SSE", "SZSE", "BSE"}
 KEYWORD_RE = re.compile(r"(?:红利|分红|股息)")
 CROSS_BORDER_RE = re.compile(r"(?:港股|港股通|恒生|香港|H股|中概|纳斯达克|标普500|日经|德国|沙特|QDII)", re.I)
+MIN_RANK_COVERAGE = 80.0
 
 
 def retry_call(label: str, func, attempts: int = 4, delay: float = 2.0):
@@ -321,10 +324,10 @@ def get_sse_pcf_holdings(etf: str) -> tuple[pd.DataFrame, str]:
             market = "OTHER"
         if not code:
             continue
-        if amount is None and not (market in A_MARKETS and is_a_stock_code(code) and quantity and quantity > 0):
-            continue
         if amount is not None and amount <= 0:
             amount = None
+        if amount is None and not (market in A_MARKETS and is_a_stock_code(code)):
+            continue
         rows.append(
             {
                 "股票代码": code,
@@ -337,12 +340,12 @@ def get_sse_pcf_holdings(etf: str) -> tuple[pd.DataFrame, str]:
                 if amount is None or not quantity or quantity == 0
                 else amount / quantity,
                 "替代标志": str(row.get("SUBSTITUTION_FLAG") or ""),
-                "权重来源": "SUBSTITUTION_CASH_AMOUNT/NAVPERCU",
+                "权重来源": "SUBSTITUTION_CASH_AMOUNT/NAVPERCU" if amount is not None else "unresolved PCF component",
                 "NAVperCU": nav_per_cu,
             }
         )
     if not rows:
-        raise RuntimeError("SSE PCF had no priced component rows")
+        raise RuntimeError("SSE PCF had no component rows")
     return pd.DataFrame(rows), period
 
 
@@ -456,10 +459,12 @@ def get_szse_pcf_holdings(etf: str, snapshot: dict[str, dict[str, Any]]) -> tupl
                 weight_source = "ComponentShare*A-share latest price/NAVperCU"
         if not code:
             continue
-        if amount is None and not (market in A_MARKETS and is_a_stock_code(code) and quantity and quantity > 0):
-            continue
         if market in A_MARKETS and not is_a_stock_code(code):
             market = "OTHER"
+        if amount is None and not (market in A_MARKETS and is_a_stock_code(code)):
+            continue
+        if amount is None:
+            weight_source = "unresolved PCF component"
         rows.append(
             {
                 "股票代码": code,
@@ -476,7 +481,7 @@ def get_szse_pcf_holdings(etf: str, snapshot: dict[str, dict[str, Any]]) -> tupl
             }
         )
     if not rows:
-        raise RuntimeError("SZSE PCF had no priced component rows")
+        raise RuntimeError("SZSE PCF had no component rows")
     return pd.DataFrame(rows), period
 
 
@@ -640,7 +645,7 @@ def build_metrics_for_etf(
 ) -> tuple[dict[str, Any] | None, pd.DataFrame | None, str | None]:
     try:
         if holdings is None:
-            holdings, period, source = get_pcf_holdings(etf, {"price": p for p in (implied_prices or {}) if False} or {})
+            holdings, period, source = get_pcf_holdings(etf, {})
         holdings = holdings.copy()
         holdings["权重%"] = pd.to_numeric(holdings["权重%"], errors="coerce")
         if implied_prices:
@@ -720,38 +725,119 @@ def build_metrics_for_etf(
 
 def write_outputs(out_dir: Path, report: pd.DataFrame, candidates: pd.DataFrame, errors: list[dict[str, Any]]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    candidates.to_csv(out_dir / "keyword_candidates.csv", index=False, encoding="utf-8-sig")
-    if errors:
-        pd.DataFrame(errors).to_csv(out_dir / "excluded_or_errors.csv", index=False, encoding="utf-8-sig")
-    else:
-        stale_errors = out_dir / "excluded_or_errors.csv"
-        if stale_errors.exists():
-            stale_errors.unlink()
-    report = report.sort_values("股息率%", ascending=False, na_position="last").reset_index(drop=True)
-    report.insert(0, "排名_按股息率", range(1, len(report) + 1))
-    report.to_csv(out_dir / "a_share_dividend_etf_pcf_metrics.csv", index=False, encoding="utf-8-sig")
-    with pd.ExcelWriter(out_dir / "a_share_dividend_etf_pcf_metrics.xlsx", engine="openpyxl") as writer:
-        report.to_excel(writer, index=False, sheet_name="A股红利ETF穿透")
-        ws = writer.book["A股红利ETF穿透"]
-        ws.freeze_panes = "A2"
-        for col in range(1, len(report.columns) + 1):
-            width = 14
-            if col == 3:
-                width = 28
-            ws.column_dimensions[ws.cell(1, col).column_letter].width = width
-        for row in ws.iter_rows(min_row=2):
-            for cell in row:
-                if isinstance(cell.value, float):
-                    cell.number_format = "0.00"
+    report = report.copy()
+    required = [
+        "ETF代码",
+        "ETF名称",
+        "穿透口径",
+        "股息率%",
+        "股息率覆盖权重%",
+        "PE",
+        "PE覆盖权重%",
+        "PB",
+        "PB覆盖权重%",
+        "收益币种",
+        "数据状态",
+        "错误",
+    ]
+    for column in required:
+        if column not in report.columns:
+            report[column] = None
+    report["ETF代码"] = report["ETF代码"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+    report["穿透口径"] = report["穿透口径"].fillna("PCF申赎篮子估算")
+    report["收益币种"] = report["收益币种"].fillna("CNY")
+
+    error_map: dict[str, list[str]] = {}
+    for item in errors:
+        code = re.sub(r"\.0$", "", str(item.get("ETF代码") or "")).zfill(6)
+        message = str(item.get("说明") or item.get("错误") or "未产出结果")
+        if code.strip("0"):
+            error_map.setdefault(code, []).append(message)
+    completed = set(report["ETF代码"])
+    failed_rows = []
+    for _, candidate in candidates.iterrows():
+        code = re.sub(r"\.0$", "", str(candidate.get("ETF代码") or "")).zfill(6)
+        if code in completed:
+            continue
+        row = {column: None for column in report.columns}
+        row.update(
+            {
+                "ETF代码": code,
+                "ETF名称": str(candidate.get("ETF名称") or ""),
+                "穿透口径": "PCF申赎篮子估算",
+                "收益币种": "CNY",
+                "数据状态": "失败",
+                "错误": "; ".join(dict.fromkeys(error_map.get(code, ["未产出结果"]))),
+            }
+        )
+        failed_rows.append(row)
+    if failed_rows:
+        report = pd.concat([report, pd.DataFrame(failed_rows)], ignore_index=True)
+
+    coverage = pd.to_numeric(report["股息率覆盖权重%"], errors="coerce")
+    dividend = pd.to_numeric(report["股息率%"], errors="coerce")
+    pe_coverage = pd.to_numeric(report["PE覆盖权重%"], errors="coerce")
+    pe = pd.to_numeric(report["PE"], errors="coerce")
+    pb_coverage = pd.to_numeric(report["PB覆盖权重%"], errors="coerce")
+    pb = pd.to_numeric(report["PB"], errors="coerce")
+    errors_blank = report["错误"].fillna("").astype(str).str.strip().eq("")
+    rankable = (
+        errors_blank
+        & coverage.ge(MIN_RANK_COVERAGE)
+        & dividend.notna()
+        & pe_coverage.ge(MIN_RANK_COVERAGE)
+        & pe.notna()
+        & pb_coverage.ge(MIN_RANK_COVERAGE)
+        & pb.notna()
+    )
+    report.loc[errors_blank & rankable, "数据状态"] = "有效"
+    report.loc[errors_blank & ~rankable, "数据状态"] = "覆盖不足"
+    report["_rankable"] = rankable
+    report = report.sort_values(["_rankable", "股息率%", "ETF代码"], ascending=[False, False, True], na_position="last").reset_index(drop=True)
+    ranks = pd.Series(pd.NA, index=report.index, dtype="Int64")
+    ranks.loc[report["_rankable"]] = range(1, int(report["_rankable"].sum()) + 1)
+    report.insert(0, "排名_按股息率", ranks)
+    report.drop(columns="_rankable", inplace=True)
+    with tempfile.TemporaryDirectory(prefix=".pcf-a-stage-", dir=out_dir) as tmpdir:
+        stage = Path(tmpdir)
+        candidates_path = stage / "keyword_candidates.csv"
+        report_csv = stage / "a_share_dividend_etf_pcf_metrics.csv"
+        report_xlsx = stage / "a_share_dividend_etf_pcf_metrics.xlsx"
+        candidates.to_csv(candidates_path, index=False, encoding="utf-8-sig")
+        report.to_csv(report_csv, index=False, encoding="utf-8-sig")
+        staged_files = [
+            (candidates_path, out_dir / candidates_path.name),
+            (report_csv, out_dir / report_csv.name),
+        ]
+        stale_targets: list[Path] = []
+        if errors:
+            errors_path = stage / "excluded_or_errors.csv"
+            pd.DataFrame(errors).to_csv(errors_path, index=False, encoding="utf-8-sig")
+            staged_files.append((errors_path, out_dir / errors_path.name))
+        else:
+            stale_targets.append(out_dir / "excluded_or_errors.csv")
+        with pd.ExcelWriter(report_xlsx, engine="openpyxl") as writer:
+            report.to_excel(writer, index=False, sheet_name="A股红利ETF穿透")
+            ws = writer.book["A股红利ETF穿透"]
+            ws.freeze_panes = "A2"
+            for col in range(1, len(report.columns) + 1):
+                width = 28 if col == 3 else 14
+                ws.column_dimensions[ws.cell(1, col).column_letter].width = width
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    if isinstance(cell.value, float):
+                        cell.number_format = "0.00"
+        staged_files.append((report_xlsx, out_dir / report_xlsx.name))
+        publish_staged_files(staged_files, stale_targets=stale_targets)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", default="lookthrough-a-share-dividend-keywords-pcf-metrics")
     parser.add_argument("--min-a-weight", type=float, default=80.0)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--sleep", type=float, default=0.05)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     out_dir = Path(args.out_dir)
     print("Loading ETF candidates...")
@@ -844,7 +930,7 @@ def main() -> int:
     print(out_dir / "a_share_dividend_etf_pcf_metrics.xlsx")
     print(out_dir / "a_share_dividend_etf_pcf_metrics.csv")
     print(f"rows={len(report)}")
-    return 0
+    return 1 if report.empty else 0
 
 
 if __name__ == "__main__":

@@ -26,6 +26,16 @@ python "$SKILL_DIR\scripts\run_pcf_metrics.py" --input ".\my_etf_list.csv" --cod
 
 默认输入路径是 `lookthrough-hk-all-ranking/all_etf_summary.csv`。这个文件不会随仓库自带；如果没有，请先生成 ETF 发现结果，或直接用 `--etf` 指定代码。
 
+### A 股红利关键词 ETF
+
+扫描名称含“红利”“分红”“股息”、且底层主要为 A 股的 ETF：
+
+```powershell
+python "$SKILL_DIR\scripts\run_a_share_dividend_etf_pcf_metrics.py" --out-dir a-share-dividend-output
+```
+
+最终表为 `a_share_dividend_etf_pcf_metrics.csv` 和 `.xlsx`。抓取失败或不满足 A 股权重门槛的候选仍保留在最终表；股息率、PE、PB 任一指标为空或覆盖权重低于 80% 时，行保留供审计，但不标记为“有效”或参与排名。全部候选失败时命令返回非零状态。
+
 ### 批量美股成分 ETF 排名
 
 用于 A 股上市、底层为美股的 ETF/QDII：
@@ -63,12 +73,13 @@ python "$SKILL_DIR\scripts\us_listed_etf_lookthrough.py" --ticker QQQ.US,DRAM.US
 - 美股 ETF ticker 解析先用 SEC mutual fund/class ticker map，再用 SEC exchange ticker map，不限于手写 NYSE Arca/Nasdaq/Cboe 样例。
 - SEC NPORT fallback 能提供完整持仓，但相对当前日有滞后。
 - `DRAM` 等 Roundhill ETF 优先使用发行商每日持仓 CSV。
-- `QQQ` 在 Invesco 接口拒绝脚本请求时，可退回 SEC NPORT 完整持仓。
+- Invesco ETF 先从产品目录把 ticker 解析为 CUSIP，再请求持仓接口；若边缘节点拒绝请求，可退回 SEC NPORT 完整持仓。
 - 成分股 PE/PB、价格、股息率优先使用 Yahoo quoteSummary。
 - SEC N-PORT 只有 CUSIP 的成分先通过无需 API key 的 OpenFIGI 映射 ticker，Yahoo 搜索作为兜底。
+- 发行商文件中的韩国、日本、台湾、香港和 A 股常见 Bloomberg 代码会转换为 Yahoo symbol 后查询估值；无法可靠映射的市场仍保留原持仓和缺失诊断。
 - sector 和 industry 使用 Nasdaq quote endpoint 补充。
-- ETF 收益/风险指标优先使用 Nasdaq chart 数据；组合收益/风险从合成 ETF 价格曲线重新计算。
-- 默认不写缓存。加 `--cache` 后，持仓、成分股指标和 ETF 价格历史写入 `out-dir/cache`；加 `--refresh-cache` 可清理旧缓存。
+- ETF 收益/风险指标优先使用 Yahoo adjusted chart，Nasdaq chart 和 AkShare 作为 fallback；组合收益/风险从合成 ETF 价格曲线重新计算。
+- 默认不写缓存。加 `--cache` 后，持仓、成分股指标和 ETF 价格历史写入 `out-dir/cache`；只有 schema 版本匹配的缓存才会读取，持仓与估值缓存最多复用 24 小时，行情缓存还要求末日距当前不超过 7 天。`--refresh-cache` 即使不同时开启 `--cache` 也会清理旧缓存。
 - `--lookback-days` 是 `--nav-lookback-days` 的别名。
 
 ### 自选 ETF 或 ETF 组合
@@ -103,7 +114,7 @@ python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,5131
 
 常用参数：
 
-- `--markets auto,a,hk,us,us_listed`：给全部 ETF 指定同一模式，或为每只 ETF 指定一个模式。
+- `--markets auto,a,hk,us,us_listed`：给全部 ETF 指定同一模式，或为每只 ETF 指定一个模式。`auto` 会合并同一 ETF 中成功解析出的 A/HK/US 成分；某市场确认无适用股票时可继续，真实解析错误会写入 ETF 的 `错误` 字段并使相关约束进入“数据不足”。
 - `--us-script`：覆盖 A 股上市美股成分 ETF helper 路径。
 - `--us-listed-script`：覆盖直接美股上市 ETF helper 路径。
 - `--target-a-weight`、`--target-hk-weight`、`--target-us-weight`：最低市场穿透暴露检查。
@@ -119,15 +130,17 @@ python "$SKILL_DIR\scripts\selected_etf_lookthrough.py" --etf 510880,159569,5131
 - PE：盈利收益率聚合，公式为 `sum(weight) / sum(weight / PE)`。
 - PB：对有覆盖且为正的 PB 做加权平均。
 - 收益/风险：四条入口共用同一计算函数；优先累计净值、前复权或 adjusted close，未复权 fallback 会明确标记未计现金分红。
-- 组合收益/风险：按初始权重买入并持有的组合曲线重新计算，不把单只 ETF 指标简单加权。
+- 组合收益/风险：按初始权重买入并持有的组合曲线重新计算，不把单只 ETF 指标简单加权；曲线只使用所有 ETF 都有真实历史覆盖的共同区间，不把已停止更新的价格无限前填。
+- 行情与汇率先归一到交易日期再对齐；同一日不同时间戳不会被误算成两个收益观测。
 - 自选跨市场组合统一换算为 CNY；美股专用脚本单独运行时保持 USD。
 - 集中度：Top5/10/20 和最大单股暴露会先合并重复股票，再计算真实组合穿透权重。
 - 行业/主题：当前是规则估计，并明确标注不是官方申万/中信映射。
 - 近 3 年收益：历史不足时留空，不用短窗口冒充。
-- 约束检查：同一股票按“底层市场 + 标准化代码”合并；PE/PB/股息率覆盖低于 80% 时显示“数据不足”。
+- 约束检查：同一股票按“底层市场 + 标准化代码”合并；PE/PB/股息率覆盖低于 80%、任一 ETF 穿透失败或存在未定价成分时，相关约束显示“数据不足”。
 - US ticker：去空格、转大写，并保留字母、数字、点和连字符；不会把 `AAPL`、`MSFT`、`NVDA`、`BRK.B`、`BRK-B` 补零。
 - US PCF 权重：优先用 PCF 现金替代金额除以 `NAVperCU`；只有数量时可估算 `ComponentShare * US latest price * USD/CNY / NAVperCU`，并在权重来源中记录。
-- US 估值：A 股上市美股成分 ETF 使用现有 AkShare endpoint best effort；直接美股上市 ETF 使用 Yahoo quoteSummary，并用 Nasdaq 补行业信息。缺失或限流时保留空值和诊断。
+- US 估值：A 股上市美股成分 ETF 使用现有 AkShare endpoint best effort；直接美股上市 ETF 及可映射的国际股票成分使用 Yahoo quoteSummary，美国股票再用 Nasdaq 补行业信息。常见 Bloomberg 交易所代码会转换为 Yahoo symbol，SEC/Yahoo 搜索也接受非美国上市的股票结果；仍无法映射的证券保留 CUSIP/名称身份并写入估值错误，不会把 CUSIP 当作 ticker 查询。明确为零的年度股息保留为 `0`；来源未明确时仍留空。明显异常的 PB（低于 `0.05` 或高于 `1000`）不参与聚合，并写入诊断。
+- 输出先写入运行级临时目录，核心文件校验通过后再发布，`run_manifest.json` 最后替换；紧凑模式会清理上一轮由脚本生成的辅助文件。
 
 参考：
 
@@ -203,5 +216,5 @@ python scripts\selected_etf_lookthrough.py --etf 510880,159569,513100,QQQ.US --m
 - 生成输出已写入 `.gitignore`，避免误提交中间文件。
 - 跨境 PCF 可能出现现金替代行、成分元数据不完整或交易所市场代码差异；脚本保留来源代码和诊断，不静默猜测。
 - ETF-of-ETF、ETN、商品/加密信托及衍生品不会递归展开，当前层级和未穿透权重会保留。
-- 美股市场和估值 endpoint 可能限流或缺字段；缺失的成分指标记录在 `估值错误`，ETF 级 PE/PB 会在覆盖率足够时继续聚合。
+- 美股市场和估值 endpoint 可能限流或缺字段；缺失的成分指标记录在 `估值错误`。只有股息率、PE、PB 都达到 80% 覆盖且数值有效时，最终排名表才标记为“有效”。
 - 输出是数据计算结果，不是投资建议。

@@ -13,6 +13,7 @@ import json
 import math
 import re
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
@@ -28,7 +29,14 @@ try:
 except Exception:  # pragma: no cover - tests can run without akshare network deps
     ak = None  # type: ignore[assignment]
 
-from pcf_common import combine_price_series, earnings_yield_pe, price_series_metrics, to_float, weighted_average
+from pcf_common import (
+    combine_price_series,
+    earnings_yield_pe,
+    price_series_metrics,
+    publish_staged_files,
+    to_float,
+    weighted_average,
+)
 
 
 C_ETF_CODE = "ETF代码"
@@ -84,11 +92,117 @@ EXTRA_OUTPUTS = [
 ]
 
 SEC_HEADERS = {
-    "User-Agent": "Jimmy-asks-AI a-share-etf-pcf-metrics research contact jimmy@example.com",
+    "User-Agent": "Jimmy-asks-AI a-share-etf-pcf-metrics https://github.com/Jimmy-asks-AI/a-share-etf-pcf-metrics",
     "Accept-Encoding": "gzip, deflate",
 }
 ROUNDHILL_TICKERS = {"DRAM"}
 YAHOO_SEARCH_CACHE: dict[str, str] = {}
+CACHE_SCHEMA_VERSION = 1
+HOLDINGS_CACHE_MAX_HOURS = 24
+METRICS_CACHE_MAX_HOURS = 24
+PRICE_CACHE_MAX_HOURS = 24
+PRICE_CACHE_MAX_LAST_DATE_AGE_DAYS = 7
+BLOOMBERG_TO_YAHOO_SUFFIX = {
+    "AU": "AX",
+    "AV": "VI",
+    "BB": "BR",
+    "BZ": "SA",
+    "CN": "TO",
+    "CV": "V",
+    "DC": "CO",
+    "FH": "HE",
+    "FP": "PA",
+    "GR": "F",
+    "GY": "DE",
+    "IB": "BO",
+    "ID": "IR",
+    "IJ": "JK",
+    "IM": "MI",
+    "IN": "NS",
+    "IS": "IS",
+    "IT": "TA",
+    "LN": "L",
+    "MK": "KL",
+    "MM": "MX",
+    "NA": "AS",
+    "NO": "OL",
+    "NZ": "NZ",
+    "PL": "LS",
+    "PW": "WA",
+    "SJ": "JO",
+    "SM": "MC",
+    "SP": "SI",
+    "SS": "ST",
+    "SW": "SW",
+    "TB": "BK",
+}
+COUNTRY_TO_YAHOO_SUFFIX = {
+    "AT": "VI",
+    "AU": "AX",
+    "BE": "BR",
+    "BR": "SA",
+    "CA": "TO",
+    "CH": "SW",
+    "DE": "DE",
+    "DK": "CO",
+    "ES": "MC",
+    "FI": "HE",
+    "FR": "PA",
+    "GB": "L",
+    "ID": "JK",
+    "IE": "IR",
+    "IL": "TA",
+    "IN": "NS",
+    "IT": "MI",
+    "MX": "MX",
+    "MY": "KL",
+    "NL": "AS",
+    "NO": "OL",
+    "NZ": "NZ",
+    "PL": "WA",
+    "PT": "LS",
+    "SE": "ST",
+    "SG": "SI",
+    "TH": "BK",
+    "TR": "IS",
+    "ZA": "JO",
+}
+NON_EQUITY_MARKETS = {
+    "ABS-MBS",
+    "BOND",
+    "CASH",
+    "DBT",
+    "DCO",
+    "LON",
+    "OTHER",
+    "STIV",
+    "SWAP",
+}
+MIN_PLAUSIBLE_PB = 0.05
+MAX_PLAUSIBLE_PB = 1000.0
+INVESCO_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,*/*",
+    "Referer": "https://www.invesco.com/",
+}
+INVESCO_SEARCH_FIELDS = ",".join(
+    [
+        "uniqueIdentifier",
+        "cusip",
+        "title",
+        "accountName",
+        "ticker",
+    ]
+)
+INVESCO_SEARCH_URL = (
+    "https://dng-api.invesco.com/product/search"
+    '?fq=countryCode:%22US%22&fq=language:%22en_us%22&fq=accountType:%22ETF%22'
+    '&fq=contentType:%22Product%22&fq=shareClassStatus:%22open%22&q=_suggest_:*'
+    f"&fl={INVESCO_SEARCH_FIELDS}&rows=2000&start=0"
+)
 
 
 @dataclass(frozen=True)
@@ -116,6 +230,44 @@ def normalize_us_ticker(value: Any) -> str:
     return re.sub(r"[^A-Z0-9.\-]", "", text)
 
 
+def yahoo_symbol_for_holding(value: Any, market: Any) -> str:
+    raw = str(value or "").strip().upper()
+    market_text = str(market or "").strip().upper()
+    if raw.startswith(("CUSIP:", "UNMAPPED:")):
+        return ""
+    parts = raw.split()
+    base = parts[0] if parts else ""
+    suffix = parts[-1] if len(parts) > 1 else ""
+    if market_text in NON_EQUITY_MARKETS:
+        return ""
+    if len(parts) == 1 and re.fullmatch(r"[A-Z0-9][A-Z0-9.\-]{0,15}\.[A-Z]{1,3}", raw):
+        return normalize_us_ticker(raw)
+    if suffix in {"KS", "KQ"} or market_text == "KR":
+        return f"{base}.{suffix if suffix in {'KS', 'KQ'} else 'KS'}"
+    if suffix == "TT" or market_text == "TW":
+        return f"{base}.TW"
+    if suffix == "JP" or market_text == "JP":
+        return f"{base}.T"
+    if suffix == "HK" or market_text == "HK":
+        digits = re.sub(r"\D", "", base)
+        return f"{digits.zfill(4)}.HK" if digits else ""
+    if suffix in {"C1", "C2"} or market_text in {"CN", "A"}:
+        digits = re.sub(r"\D", "", base)
+        if not digits:
+            return ""
+        exchange = "SS" if digits.startswith(("5", "6", "9")) else "SZ"
+        return f"{digits.zfill(6)}.{exchange}"
+    if suffix in {"US", "UA", "UN", "UP", "UQ"}:
+        return normalize_us_ticker(base)
+    yahoo_suffix = BLOOMBERG_TO_YAHOO_SUFFIX.get(suffix)
+    if yahoo_suffix:
+        return f"{base}.{yahoo_suffix}"
+    country_suffix = COUNTRY_TO_YAHOO_SUFFIX.get(market_text)
+    if country_suffix and len(parts) == 1:
+        return f"{base}.{country_suffix}"
+    return normalize_us_ticker(raw)
+
+
 def parse_tickers(raw: str) -> list[str]:
     tickers: list[str] = []
     seen: set[str] = set()
@@ -135,6 +287,8 @@ def parse_weights(raw: str | None, count: int) -> list[float]:
     values = [float(item) for item in re.split(r"[,;\s]+", raw.strip()) if item.strip()]
     if len(values) != count:
         raise ValueError(f"--weights count ({len(values)}) must match ticker count ({count}).")
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError("--weights must contain only finite numbers.")
     if any(value < 0 for value in values):
         raise ValueError("--weights cannot contain negative values.")
     total = sum(values)
@@ -147,7 +301,7 @@ def parse_weights(raw: str | None, count: int) -> list[float]:
 
 
 def clean_number(value: Any) -> float | None:
-    text = str(value or "").strip().replace(",", "").replace("\u202a", "").replace("\u202c", "").replace("$", "")
+    text = ("" if value is None else str(value)).strip().replace(",", "").replace("\u202a", "").replace("\u202c", "").replace("$", "")
     if text.endswith("%"):
         text = text[:-1]
     if text in {"", "-", "--", "nan", "None"}:
@@ -178,6 +332,27 @@ def raw_number(value: Any) -> float | None:
     return clean_number(value)
 
 
+def dividend_yield_from_summary(summary: dict[str, Any]) -> float | None:
+    dividend_yield = raw_number(summary.get("dividendYield"))
+    if dividend_yield is not None:
+        return dividend_yield * 100
+    annual_rates = [
+        raw_number(summary.get("trailingAnnualDividendRate")),
+        raw_number(summary.get("dividendRate")),
+    ]
+    observed_rates = [value for value in annual_rates if value is not None]
+    if observed_rates and all(value == 0 for value in observed_rates):
+        return 0.0
+    return None
+
+
+def plausible_pb(value: Any) -> float | None:
+    pb = raw_number(value)
+    if pb is None or not MIN_PLAUSIBLE_PB <= pb <= MAX_PLAUSIBLE_PB:
+        return None
+    return pb
+
+
 def yahoo_quote_summary(ticker: str) -> dict[str, Any]:
     session = requests.Session()
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -195,11 +370,16 @@ def yahoo_quote_summary(ticker: str) -> dict[str, Any]:
     summary = data.get("summaryDetail") or {}
     stats = data.get("defaultKeyStatistics") or {}
     price = data.get("price") or {}
+    raw_pb = raw_number(stats.get("priceToBook"))
+    pb = plausible_pb(raw_pb)
     return {
         C_PRICE: raw_number(price.get("regularMarketPrice")),
         C_PE: raw_number(summary.get("trailingPE") or stats.get("trailingPE")),
-        C_PB: raw_number(stats.get("priceToBook")),
-        C_DY: None if raw_number(summary.get("dividendYield")) is None else raw_number(summary.get("dividendYield")) * 100,
+        C_PB: pb,
+        C_DY: dividend_yield_from_summary(summary),
+        C_VAL_ERROR: ""
+        if raw_pb is None or pb is not None
+        else f"Yahoo priceToBook outside plausibility range: {raw_pb}",
     }
 
 
@@ -229,18 +409,71 @@ def cache_key(value: str) -> str:
     return re.sub(r"[^A-Z0-9._-]", "_", value.upper())
 
 
-def read_json_cache(path: Path) -> Any | None:
+def cache_is_fresh(path: Path, max_age_hours: float) -> bool:
+    if not path.exists():
+        return False
+    return time.time() - path.stat().st_mtime <= max_age_hours * 3600
+
+
+def read_json_cache(path: Path, max_age_hours: float | None = None) -> Any | None:
     if not path.exists():
         return None
+    if max_age_hours is not None and not cache_is_fresh(path, max_age_hours):
+        return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or "_cache" not in value or "payload" not in value:
+            return None
+        if not isinstance(value["_cache"], dict):
+            return None
+        if value["_cache"].get("schema_version") != CACHE_SCHEMA_VERSION:
+            return None
+        return value["payload"]
     except Exception:
         return None
 
 
 def write_json_cache(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    envelope = {
+        "_cache": {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        },
+        "payload": payload,
+    }
+    path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_price_cache(path: Path, min_rows: int) -> pd.DataFrame | None:
+    if not cache_is_fresh(path, PRICE_CACHE_MAX_HOURS):
+        return None
+    try:
+        temp = pd.read_csv(path)
+        if "cache_schema_version" not in temp.columns:
+            return None
+        versions = pd.to_numeric(temp["cache_schema_version"], errors="coerce").dropna().unique()
+        if len(versions) != 1 or int(versions[0]) != CACHE_SCHEMA_VERSION:
+            return None
+        temp["date"] = pd.to_datetime(temp["date"], errors="coerce")
+        temp["close"] = pd.to_numeric(temp["close"], errors="coerce")
+        temp = temp.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date", keep="last")
+        if len(temp) < min_rows:
+            return None
+        last_date = temp["date"].iloc[-1].date()
+        if (date.today() - last_date).days > PRICE_CACHE_MAX_LAST_DATE_AGE_DAYS:
+            return None
+        return temp
+    except Exception:
+        return None
+
+
+def write_price_cache(path: Path, series: pd.Series) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame({"date": series.index, "close": series.to_numpy()})
+    frame["fetched_at"] = datetime.now().isoformat(timespec="seconds")
+    frame["cache_schema_version"] = CACHE_SCHEMA_VERSION
+    frame.to_csv(path, index=False, encoding="utf-8-sig")
 
 
 def company_name_key(value: str) -> str:
@@ -258,11 +491,18 @@ def openfigi_ticker(cusip: str) -> str:
     )
     response.raise_for_status()
     payload = response.json()
+    candidates: list[tuple[bool, str]] = []
     for item in ((payload or [{}])[0].get("data") or []):
-        if item.get("exchCode") == "US" and item.get("marketSector") == "Equity":
-            ticker = normalize_us_ticker(item.get("ticker"))
-            if ticker:
-                return ticker
+        if item.get("marketSector") != "Equity":
+            continue
+        ticker = str(item.get("ticker") or "").strip()
+        exchange = str(item.get("exchCode") or "").strip().upper()
+        symbol = yahoo_symbol_for_holding(f"{ticker} {exchange}".strip(), "")
+        if symbol:
+            candidates.append((exchange == "US", symbol))
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
     return ""
 
 
@@ -287,15 +527,21 @@ def resolve_security_ticker(name: str, cusip: str, ticker_by_name: dict[str, str
                     params={"q": query, "quotesCount": 10, "newsCount": 0},
                     headers={"User-Agent": "Mozilla/5.0"},
                 )
+                candidates = []
                 for quote in payload.get("quotes") or []:
                     symbol = normalize_us_ticker(quote.get("symbol"))
                     exchange = str(quote.get("exchange") or "").upper()
-                    if symbol and quote.get("quoteType") in {"EQUITY", "ETF"} and exchange in {"NMS", "NGM", "NCM", "NYQ", "PCX", "BTS", "NAS"}:
-                        YAHOO_SEARCH_CACHE[cusip] = symbol
-                        return symbol
+                    if symbol and quote.get("quoteType") in {"EQUITY", "ETF"}:
+                        is_us = exchange in {"NMS", "NGM", "NCM", "NYQ", "PCX", "BTS", "NAS"}
+                        candidates.append((is_us, symbol))
+                if candidates:
+                    candidates.sort(key=lambda item: item[0], reverse=True)
+                    YAHOO_SEARCH_CACHE[cusip] = candidates[0][1]
+                    return candidates[0][1]
         except Exception:
             pass
-    return cusip or name
+    YAHOO_SEARCH_CACHE[cusip] = ""
+    return ""
 
 
 def sec_ticker_maps() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
@@ -337,11 +583,11 @@ def select_sec_nport_filing(recent: dict[str, Any], cik: str, series_id: str | N
         if not series_id:
             return form, acc, doc, filing_date
         acc_no_dash = acc.replace("-", "")
-        xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_dash}/primary_doc.xml"
+        xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_dash}/{doc}"
         try:
             xml_text = request_text(xml_url, headers=SEC_HEADERS)
             checked.append(acc)
-            if series_id in xml_text[:15000]:
+            if series_id in xml_text:
                 return form, acc, doc, filing_date
         except Exception:
             continue
@@ -349,16 +595,25 @@ def select_sec_nport_filing(recent: dict[str, Any], cik: str, series_id: str | N
 
 
 def fetch_sec_nport_holdings(ticker: str) -> tuple[list[Holding], dict[str, Any]]:
-    cik_by_ticker, ticker_by_name, name_by_ticker = sec_ticker_maps()
-    fund_info = sec_fund_ticker_map().get(ticker)
+    errors: list[str] = []
+    try:
+        fund_info = sec_fund_ticker_map().get(ticker)
+    except Exception as exc:  # noqa: BLE001
+        fund_info = None
+        errors.append(f"fund ticker map: {exc}")
+    try:
+        cik_by_ticker, ticker_by_name, name_by_ticker = sec_ticker_maps()
+    except Exception as exc:  # noqa: BLE001
+        cik_by_ticker, ticker_by_name, name_by_ticker = {}, {}, {}
+        errors.append(f"company ticker map: {exc}")
     cik = (fund_info or {}).get("cik") or cik_by_ticker.get(ticker)
     if not cik:
-        raise RuntimeError(f"SEC ticker maps have no CIK for {ticker}")
+        raise RuntimeError(f"SEC ticker maps have no CIK for {ticker}. {'; '.join(errors)}")
     submissions = request_json(f"https://data.sec.gov/submissions/CIK{cik}.json")
     recent = submissions.get("filings", {}).get("recent", {})
-    form, accession, _doc, filing_date = select_sec_nport_filing(recent, cik, (fund_info or {}).get("seriesId"))
+    form, accession, doc, filing_date = select_sec_nport_filing(recent, cik, (fund_info or {}).get("seriesId"))
     acc_no_dash = accession.replace("-", "")
-    xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_dash}/primary_doc.xml"
+    xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_dash}/{doc}"
     root = ET.fromstring(request_text(xml_url, headers=SEC_HEADERS).encode("utf-8"))
 
     def find_text(node: ET.Element, name: str) -> str:
@@ -376,14 +631,20 @@ def fetch_sec_nport_holdings(ticker: str) -> tuple[list[Holding], dict[str, Any]
         weight = clean_number(find_text(inv, "pctVal"))
         if weight is None:
             continue
-        security_ticker = resolve_security_ticker(name, cusip, ticker_by_name)
         asset = find_text(inv, "assetCat")
         country = find_text(inv, "invCountry")
-        market = "US" if asset == "EC" and country == "US" else (country or asset or "OTHER")
+        reported_ticker = find_text(inv, "ticker")
+        security_ticker = (
+            yahoo_symbol_for_holding(reported_ticker, country)
+            if reported_ticker
+            else resolve_security_ticker(name, cusip, ticker_by_name)
+        )
+        market = (country or "OTHER") if asset == "EC" else (asset or country or "OTHER")
+        security_id = security_ticker or (f"CUSIP:{cusip}" if cusip else f"UNMAPPED:{company_name_key(name)}")
         price = value_usd / balance if value_usd and balance else None
         holdings.append(
             Holding(
-                ticker=security_ticker,
+                ticker=security_id,
                 name=name,
                 weight_pct=weight,
                 market=market,
@@ -435,8 +696,16 @@ def parse_roundhill_holdings_csv(text: str, ticker: str, source_url: str) -> tup
             market = "SWAP"
         elif upper.endswith(" KS"):
             market = "KR"
+        elif upper.endswith(" KQ"):
+            market = "KR"
         elif upper.endswith(" TT"):
             market = "TW"
+        elif upper.endswith(" JP"):
+            market = "JP"
+        elif upper.endswith((" C1", " C2")):
+            market = "CN"
+        elif upper.endswith(" HK"):
+            market = "HK"
         else:
             market = "US"
         holdings.append(
@@ -467,28 +736,70 @@ def parse_roundhill_holdings_csv(text: str, ticker: str, source_url: str) -> tup
 def fetch_roundhill_holdings(ticker: str) -> tuple[list[Holding], dict[str, Any]]:
     today = date.today()
     errors: list[str] = []
-    # ponytail: try a small +/- window; if Roundhill changes naming, switch to page JS discovery.
-    candidates = [today + timedelta(days=offset) for offset in range(2, -31, -1)]
+    candidates = [today - timedelta(days=offset) for offset in range(31)]
     for day in candidates:
         stamp = day.strftime("%m%d%Y")
         url = f"https://www.roundhillinvestments.com/assets/data/FilepointRoundhill.40RU.RU_Holdings_{stamp}.csv"
         try:
             text = request_text(url)
-            return parse_roundhill_holdings_csv(text, ticker, url)
+            result = parse_roundhill_holdings_csv(text, ticker, url)
+            source_date = pd.to_datetime(result[1].get("period"), errors="coerce")
+            if pd.notna(source_date) and source_date.date() > today:
+                raise RuntimeError(f"source file reports future holdings date {source_date.date()}")
+            return result
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{stamp}:{str(exc)[:80]}")
     raise RuntimeError("Roundhill holdings CSV lookup failed. " + "; ".join(errors[:5]))
 
 
+def request_invesco_json(url: str) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            response = requests.get(url, headers=INVESCO_HEADERS, timeout=25)
+            if response.status_code >= 500 and attempt < 4:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError("Invesco response is not a JSON object")
+            return payload
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status is not None and status < 500:
+                break
+            if attempt < 4:
+                time.sleep(0.25 * (attempt + 1))
+    raise RuntimeError(f"Invesco request failed for {url}: {last_error}") from last_error
+
+
+def first_scalar(value: Any) -> Any:
+    return value[0] if isinstance(value, list) and value else value
+
+
 def fetch_invesco_holdings(ticker: str) -> tuple[list[Holding], dict[str, Any]]:
-    url = f"https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/{ticker}/holdings/fund?idType=ticker&productType=ETF"
-    response = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*", "Referer": "https://www.invesco.com/"},
-        timeout=20,
+    catalog = request_invesco_json(INVESCO_SEARCH_URL)
+    docs = (catalog.get("response") or {}).get("docs") or []
+    product = next(
+        (
+            row
+            for row in docs
+            if str(first_scalar(row.get("ticker")) or "").strip().upper() == ticker.upper()
+        ),
+        None,
     )
-    response.raise_for_status()
-    payload = response.json()
+    if not isinstance(product, dict):
+        raise RuntimeError(f"Invesco product catalog has no ticker={ticker}")
+    cusip = str(first_scalar(product.get("cusip")) or "").strip()
+    if not cusip:
+        raise RuntimeError(f"Invesco product catalog has no CUSIP for {ticker}")
+    url = (
+        "https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/"
+        f"{cusip}/holdings/fund?idType=cusip&productType=ETF"
+    )
+    payload = request_invesco_json(url)
     rows = payload.get("holdings") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         raise RuntimeError("Invesco holdings API returned no holdings list")
@@ -499,7 +810,7 @@ def fetch_invesco_holdings(ticker: str) -> tuple[list[Holding], dict[str, Any]]:
             continue
         holdings.append(
             Holding(
-                ticker=normalize_us_ticker(row.get("ticker") or row.get("securityIdentifier")),
+                ticker=str(row.get("ticker") or row.get("securityIdentifier") or "").strip(),
                 name=str(row.get("issuerName") or row.get("securityName") or row.get("ticker") or ""),
                 weight_pct=weight,
                 market="US",
@@ -516,19 +827,21 @@ def fetch_invesco_holdings(ticker: str) -> tuple[list[Holding], dict[str, Any]]:
         )
     if not holdings:
         raise RuntimeError("Invesco holdings API parsed no weighted rows")
-    return holdings, {"etf_name": f"Invesco {ticker}", "period": holdings[0].data_date, "source": "invesco_api", "source_detail": url, "known_gap": ""}
+    etf_name = str(first_scalar(product.get("accountName")) or first_scalar(product.get("title")) or f"Invesco {ticker}")
+    return holdings, {"etf_name": etf_name, "period": holdings[0].data_date, "source": "invesco_api", "source_detail": url, "known_gap": ""}
 
 
 def fetch_holdings(ticker: str, source: str, cache_dir: Path | None = None) -> tuple[list[Holding], dict[str, Any]]:
     source = source.lower()
     cache_path = None if cache_dir is None else cache_dir / f"holdings_{cache_key(ticker)}_{source}.json"
     if cache_path is not None:
-        cached = read_json_cache(cache_path)
+        cached = read_json_cache(cache_path, HOLDINGS_CACHE_MAX_HOURS)
         if cached:
             holdings = [Holding(**item) for item in cached["holdings"]]
             meta = dict(cached["meta"])
             meta["cache"] = str(cache_path)
-            return holdings, meta
+            if holdings:
+                return holdings, meta
     errors: list[str] = []
     if source in {"auto", "issuer"} and ticker == "QQQ":
         try:
@@ -554,8 +867,6 @@ def fetch_holdings(ticker: str, source: str, cache_dir: Path | None = None) -> t
             return result
         except Exception as exc:  # noqa: BLE001
             errors.append(f"sec:{exc}")
-    if source == "yfinance":
-        raise RuntimeError("yfinance source is not implemented because yfinance is not installed.")
     raise RuntimeError(f"No holdings source succeeded for {ticker}. " + "; ".join(errors))
 
 
@@ -577,29 +888,38 @@ def valuation_indicator(ticker: str, indicator: str) -> float | None:
     return None if values.empty else float(values.iloc[-1])
 
 
-def metric_for_ticker(ticker: str) -> dict[str, Any]:
+def metric_for_ticker(ticker: str, use_nasdaq: bool = True) -> dict[str, Any]:
     ticker = normalize_us_ticker(ticker)
-    if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", ticker):
-        return {C_VAL_ERROR: "not a plain US ticker"}
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9.\-]{0,15}", ticker):
+        return {C_VAL_ERROR: "not a Yahoo-compatible ticker"}
     out = {C_VAL_SOURCE: "yahoo_quote_summary"}
     errors: list[str] = []
     try:
-        out.update(yahoo_quote_summary(ticker))
+        yahoo = yahoo_quote_summary(ticker)
+        yahoo_error = str(yahoo.pop(C_VAL_ERROR, "") or "")
+        out.update(yahoo)
+        if yahoo_error:
+            errors.append(yahoo_error)
     except Exception as exc:  # noqa: BLE001
         errors.append(f"yahoo:{str(exc)[:120]}")
     try:
+        if not use_nasdaq:
+            raise LookupError("non-US symbol; Nasdaq supplement skipped")
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*", "Referer": f"https://www.nasdaq.com/market-activity/stocks/{ticker.lower()}"}
         summary = requests.get(f"https://api.nasdaq.com/api/quote/{ticker}/summary?assetclass=stocks", headers=headers, timeout=12).json()
         info = requests.get(f"https://api.nasdaq.com/api/quote/{ticker}/info?assetclass=stocks", headers=headers, timeout=12).json()
-        summary_data = summary.get("data", {}).get("summaryData", {})
-        info_data = info.get("data", {})
+        summary_data = (summary.get("data") or {}).get("summaryData") or {}
+        info_data = info.get("data") or {}
         out[C_PRICE] = out.get(C_PRICE) or clean_number(nested_value(info_data, "primaryData", "lastSalePrice"))
-        out[C_DY] = out.get(C_DY) or clean_number(nested_value(summary_data, "Yield"))
+        if out.get(C_DY) is None:
+            out[C_DY] = clean_number(nested_value(summary_data, "Yield"))
         out[C_SECTOR] = nested_value(summary_data, "Sector")
         out[C_INDUSTRY] = nested_value(summary_data, "Industry")
         out[C_VAL_SOURCE] = "yahoo_quote_summary+nasdaq_summary"
         if out.get(C_DY) is None:
             errors.append("nasdaq_summary:no dividend yield")
+    except LookupError:
+        pass
     except Exception as exc:  # noqa: BLE001
         errors.append(f"nasdaq:{str(exc)[:120]}")
     out[C_VAL_ERROR] = "; ".join(errors)
@@ -611,25 +931,37 @@ def enrich_metrics(detail: pd.DataFrame, skip_metrics: bool, workers: int = 8, c
     for column in [C_PRICE, C_PE, C_PB, C_DY, C_SECTOR, C_INDUSTRY, C_VAL_SOURCE, C_VAL_ERROR]:
         if column not in detail.columns:
             detail[column] = None
-    if skip_metrics:
+    if skip_metrics or detail.empty:
         return detail
-    tickers = sorted(
-        {
-            str(code)
-            for code, market in zip(detail[C_STOCK_CODE], detail[C_MARKET])
-            if str(market) == "US" and re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", str(code))
-        }
-    )
+    symbol_by_index = {
+        idx: yahoo_symbol_for_holding(row.get(C_STOCK_CODE), row.get(C_MARKET))
+        for idx, row in detail.iterrows()
+    }
+    for idx, symbol in symbol_by_index.items():
+        market_value = detail.at[idx, C_MARKET]
+        market = "" if pd.isna(market_value) else str(market_value).strip().upper()
+        if not symbol and market not in NON_EQUITY_MARKETS:
+            current = str(detail.at[idx, C_VAL_ERROR] or "").strip()
+            message = "no Yahoo-compatible ticker mapping"
+            detail.at[idx, C_VAL_ERROR] = f"{current}; {message}".strip("; ") if current else message
+    symbols = sorted({symbol for symbol in symbol_by_index.values() if symbol})
+    nasdaq_by_symbol = {
+        symbol: any(
+            symbol_by_index[idx] == symbol and str(detail.at[idx, C_MARKET]) == "US"
+            for idx in detail.index
+        )
+        for symbol in symbols
+    }
     metrics: dict[str, dict[str, Any]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = {}
-        for ticker in tickers:
+        for ticker in symbols:
             cache_path = None if cache_dir is None else cache_dir / f"metrics_{cache_key(ticker)}.json"
-            cached = read_json_cache(cache_path) if cache_path is not None else None
+            cached = read_json_cache(cache_path, METRICS_CACHE_MAX_HOURS) if cache_path is not None else None
             if cached:
                 metrics[ticker] = cached
                 continue
-            futures[executor.submit(metric_for_ticker, ticker)] = (ticker, cache_path)
+            futures[executor.submit(metric_for_ticker, ticker, nasdaq_by_symbol[ticker])] = (ticker, cache_path)
         for future in concurrent.futures.as_completed(futures):
             ticker, cache_path = futures[future]
             try:
@@ -639,7 +971,7 @@ def enrich_metrics(detail: pd.DataFrame, skip_metrics: bool, workers: int = 8, c
             if cache_path is not None:
                 write_json_cache(cache_path, metrics[ticker])
     for idx, row in detail.iterrows():
-        metric = metrics.get(str(row[C_STOCK_CODE]))
+        metric = metrics.get(symbol_by_index.get(idx, ""))
         if not metric:
             continue
         for key, value in metric.items():
@@ -657,9 +989,21 @@ def build_tables(tickers: list[str], weights: list[float], source: str, cache_di
     for ticker, weight in zip(tickers, weights):
         try:
             holdings, meta = fetch_holdings(ticker, source, cache_dir=cache_dir)
+            if not holdings:
+                raise RuntimeError("holdings source returned no rows")
         except Exception as exc:  # noqa: BLE001
             failed.append({"ticker": ticker, "error": str(exc)})
-            etf_rows.append({C_ETF_CODE: ticker, C_ETF_WEIGHT: weight * 100, C_MODE: "us_listed", "错误": str(exc)})
+            etf_rows.append(
+                {
+                    C_ETF_CODE: ticker,
+                    C_ETF_WEIGHT: weight * 100,
+                    C_MODE: "us_listed",
+                    "PCF原始股票行数": 0,
+                    "有效权重行数": 0,
+                    "未定价/缺失权重行数": 0,
+                    "错误": str(exc),
+                }
+            )
             continue
         etf_name = str(meta.get("etf_name") or ticker)
         for holding in holdings:
@@ -698,15 +1042,17 @@ def build_tables(tickers: list[str], weights: list[float], source: str, cache_di
                 C_SOURCE_DETAIL: meta.get("source_detail"),
                 "穿透口径": "SEC N-PORT报告持仓" if meta.get("source") == "sec_nport" else "发行商报告持仓",
                 "底层持仓数": len(holdings),
+                "PCF原始股票行数": len(holdings),
+                "有效权重行数": len(holdings),
+                "未定价/缺失权重行数": 0,
                 "ETF内权重合计%": sum(item.weight_pct for item in holdings),
                 "数据缺口": meta.get("known_gap", ""),
+                "错误": "",
             }
         )
         manifests.append({"ticker": ticker, "input_weight": weight, **meta})
     detail = pd.DataFrame(detail_rows)
     summary = rebuild_summary(detail)
-    if detail.empty:
-        raise RuntimeError("No ETF holdings could be fetched. " + "; ".join(f"{item['ticker']}: {item['error']}" for item in failed))
     return summary, pd.DataFrame(etf_rows), detail, manifests, failed
 
 
@@ -798,36 +1144,26 @@ def yahoo_chart_series(symbol: str, lookback_days: int) -> pd.Series:
 
 def fx_series(lookback_days: int, cache_dir: Path | None = None) -> tuple[pd.Series, str]:
     cache_path = None if cache_dir is None else cache_dir / f"prices_USDCNY_{lookback_days}.csv"
-    if cache_path is not None and cache_path.exists():
-        temp = pd.read_csv(cache_path)
-        temp["date"] = pd.to_datetime(temp["date"], errors="coerce")
-        temp["close"] = pd.to_numeric(temp["close"], errors="coerce")
-        temp = temp.dropna().sort_values("date")
-        if len(temp) >= 30:
-            return pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"])), f"cache:{cache_path.name}"
+    temp = read_price_cache(cache_path, 30) if cache_path is not None else None
+    if temp is not None:
+        return pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"])), f"cache:{cache_path.name}"
     series = yahoo_chart_series("CNY=X", lookback_days)
     if cache_path is not None:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame({"date": series.index, "close": series.to_numpy()}).to_csv(cache_path, index=False, encoding="utf-8-sig")
+        write_price_cache(cache_path, series)
     return series, "yahoo_USD_CNY"
 
 
 def price_series(ticker: str, lookback_days: int, cache_dir: Path | None = None) -> tuple[pd.Series, str]:
     cache_path = None if cache_dir is None else cache_dir / f"prices_{cache_key(ticker)}_{lookback_days}.csv"
-    if cache_path is not None and cache_path.exists():
-        temp = pd.read_csv(cache_path)
-        temp["date"] = pd.to_datetime(temp["date"], errors="coerce")
-        temp["close"] = pd.to_numeric(temp["close"], errors="coerce")
-        temp = temp.dropna().sort_values("date")
-        if len(temp) >= 2:
-            return pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"])), f"cache:{cache_path.name}"
+    temp = read_price_cache(cache_path, 2) if cache_path is not None else None
+    if temp is not None:
+        return pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"])), f"cache:{cache_path.name}"
     start_date = date.today() - timedelta(days=lookback_days)
     end_date = date.today()
     try:
         series = yahoo_chart_series(ticker, lookback_days)
         if cache_path is not None:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame({"date": series.index, "close": series.to_numpy()}).to_csv(cache_path, index=False, encoding="utf-8-sig")
+            write_price_cache(cache_path, series)
         return series, "yahoo_adjusted_chart"
     except Exception:
         pass
@@ -847,8 +1183,8 @@ def price_series(ticker: str, lookback_days: int, cache_dir: Path | None = None)
             temp = temp.dropna().sort_values("date").drop_duplicates("date", keep="last")
             if len(temp) >= 30:
                 if cache_path is not None:
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    temp.to_csv(cache_path, index=False, encoding="utf-8-sig")
+                    series = pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"]))
+                    write_price_cache(cache_path, series)
                 return pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"])), "nasdaq_chart"
     except Exception:
         pass
@@ -869,7 +1205,10 @@ def price_series(ticker: str, lookback_days: int, cache_dir: Path | None = None)
     temp["date"] = pd.to_datetime(temp["date"], errors="coerce")
     temp["close"] = pd.to_numeric(temp["close"], errors="coerce")
     temp = temp.dropna().sort_values("date").drop_duplicates("date", keep="last")
-    return pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"])), "akshare_us_price"
+    series = pd.Series(temp["close"].to_numpy(float), index=pd.DatetimeIndex(temp["date"]))
+    if cache_path is not None and not series.empty:
+        write_price_cache(cache_path, series)
+    return series, "akshare_us_price"
 
 
 def return_metrics(series: pd.Series) -> dict[str, Any]:
@@ -897,19 +1236,59 @@ def return_metrics(series: pd.Series) -> dict[str, Any]:
 def build_metrics(tickers: list[str], weights: list[float], detail: pd.DataFrame, etf_summary: pd.DataFrame, lookback_days: int, skip_metrics: bool, cache_dir: Path | None = None) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     series_map: dict[str, pd.Series] = {}
+    return_errors: dict[str, str] = {}
     for ticker, weight in zip(tickers, weights):
-        frame = detail[detail[C_ETF_CODE].eq(ticker)]
-        row = {"类型": "ETF", C_ETF_CODE: ticker, C_ETF_WEIGHT: weight * 100, **aggregate_valuation(frame, C_INNER_WEIGHT)}
+        frame = detail[detail[C_ETF_CODE].eq(ticker)] if C_ETF_CODE in detail else pd.DataFrame()
+        summary = etf_summary[etf_summary[C_ETF_CODE].eq(ticker)] if C_ETF_CODE in etf_summary else pd.DataFrame()
+        source_row = summary.iloc[0] if not summary.empty else pd.Series(dtype=object)
+        holding_error = source_row.get("错误")
+        holding_error = "" if holding_error is None or pd.isna(holding_error) else str(holding_error)
+        row = {
+            "类型": "ETF",
+            C_ETF_CODE: ticker,
+            C_ETF_NAME: source_row.get(C_ETF_NAME, ""),
+            C_ETF_WEIGHT: weight * 100,
+            C_PERIOD: source_row.get(C_PERIOD),
+            C_SOURCE: source_row.get(C_SOURCE),
+            "穿透口径": source_row.get("穿透口径"),
+            "PCF原始股票行数": source_row.get("PCF原始股票行数"),
+            "有效权重行数": source_row.get("有效权重行数"),
+            "未定价/缺失权重行数": source_row.get("未定价/缺失权重行数"),
+            "错误": holding_error,
+            **aggregate_valuation(frame, C_INNER_WEIGHT),
+        }
         if not skip_metrics:
-            series, source = price_series(ticker, lookback_days, cache_dir=cache_dir)
-            series_map[ticker] = series
-            row.update(return_metrics(series))
-            row["收益来源"] = row.get("收益来源") or source
-            row["收益口径"] = "总收益/复权" if "adjusted" in source or "qfq" in source else "价格收益(未计现金分红)"
-            row["收益币种"] = "USD"
+            try:
+                series, source = price_series(ticker, lookback_days, cache_dir=cache_dir)
+                metrics = return_metrics(series)
+                row.update(metrics)
+                row["收益来源"] = source
+                row["收益口径"] = "总收益/复权" if "adjusted" in source or "qfq" in source else "价格收益(未计现金分红)"
+                row["收益币种"] = "USD"
+                if metrics.get("收益错误"):
+                    return_errors[ticker] = str(metrics["收益错误"])
+                else:
+                    series_map[ticker] = series
+            except Exception as exc:  # noqa: BLE001
+                return_errors[ticker] = str(exc)
+                row["收益错误"] = str(exc)
         rows.append(row)
-    portfolio = {"类型": "组合", C_ETF_CODE: "PORTFOLIO", C_ETF_WEIGHT: 100.0, **aggregate_valuation(detail, C_PORTFOLIO_WEIGHT)}
-    if not skip_metrics and series_map:
+    holding_errors = {
+        str(row.get(C_ETF_CODE)): str(row.get("错误"))
+        for _, row in etf_summary.iterrows()
+        if row.get("错误") is not None and not pd.isna(row.get("错误")) and str(row.get("错误")).strip()
+    }
+    portfolio = {
+        "类型": "组合",
+        C_ETF_CODE: "PORTFOLIO",
+        C_ETF_WEIGHT: 100.0,
+        "PCF原始股票行数": int(pd.to_numeric(etf_summary.get("PCF原始股票行数", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+        "有效权重行数": int(pd.to_numeric(etf_summary.get("有效权重行数", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+        "未定价/缺失权重行数": int(pd.to_numeric(etf_summary.get("未定价/缺失权重行数", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+        "错误": json.dumps(holding_errors, ensure_ascii=False) if holding_errors else "",
+        **aggregate_valuation(detail, C_PORTFOLIO_WEIGHT),
+    }
+    if not skip_metrics:
         combo = combine_price_series(series_map, dict(zip(tickers, weights)))
         if not combo.empty:
             portfolio.update(return_metrics(combo))
@@ -917,6 +1296,8 @@ def build_metrics(tickers: list[str], weights: list[float], detail: pd.DataFrame
             portfolio["收益口径"] = "总收益/复权"
             portfolio["收益币种"] = "USD"
             portfolio["组合构造"] = "初始权重买入并持有"
+        elif return_errors:
+            portfolio["收益错误"] = json.dumps(return_errors, ensure_ascii=False)
     rows.append(portfolio)
     return pd.DataFrame(rows)
 
@@ -929,6 +1310,8 @@ def exposure_table(detail: pd.DataFrame, group_col: str, name: str) -> pd.DataFr
 
 
 def valuation_buckets(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary.empty:
+        return pd.DataFrame(columns=["估值分层", C_PORTFOLIO_WEIGHT])
     rows = []
     for label, cond in [
         ("PE缺失", summary[C_PE].isna() if C_PE in summary else pd.Series(dtype=bool)),
@@ -941,6 +1324,8 @@ def valuation_buckets(summary: pd.DataFrame) -> pd.DataFrame:
 
 
 def overlap_pairs(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail.empty:
+        return pd.DataFrame(columns=["ETF1", "ETF2", "共同持仓数", "重合权重%"])
     detail = detail.copy()
     if C_MARKET not in detail.columns:
         detail[C_MARKET] = "US"
@@ -957,32 +1342,35 @@ def overlap_pairs(detail: pd.DataFrame) -> pd.DataFrame:
 
 def constraint_checks(summary: pd.DataFrame, metrics: pd.DataFrame, args: argparse.Namespace, detail: pd.DataFrame | None = None) -> pd.DataFrame:
     rows = []
+    portfolio = metrics[metrics[C_ETF_CODE].eq("PORTFOLIO")]
+    portfolio_error = "" if portfolio.empty else str(portfolio.iloc[0].get("错误") or "").strip()
+    lookthrough_complete = not portfolio_error
     if args.max_stock_weight is not None and not summary.empty:
         actual = float(pd.to_numeric(summary[C_PORTFOLIO_WEIGHT], errors="coerce").max())
-        rows.append({"约束": "单一股票最大权重", "阈值": args.max_stock_weight, "实际值": actual, "结果": "通过" if actual <= args.max_stock_weight else "不通过"})
-    portfolio = metrics[metrics[C_ETF_CODE].eq("PORTFOLIO")]
+        rows.append({"约束": "单一股票最大权重", "阈值": args.max_stock_weight, "实际值": actual, "结果": "数据不足" if not lookthrough_complete else ("通过" if actual <= args.max_stock_weight else "不通过")})
     if args.min_dividend_yield is not None and not portfolio.empty:
         actual = to_float(portfolio.iloc[0].get("股息率%"))
         coverage = to_float(portfolio.iloc[0].get("股息率覆盖权重%"))
-        status = "数据不足" if coverage is None or coverage < args.min_metric_coverage else ("未知" if actual is None else ("通过" if actual >= args.min_dividend_yield else "不通过"))
+        status = "数据不足" if not lookthrough_complete or coverage is None or coverage < args.min_metric_coverage else ("未知" if actual is None else ("通过" if actual >= args.min_dividend_yield else "不通过"))
         rows.append({"约束": "组合最低股息率", "阈值": args.min_dividend_yield, "实际值": actual, "覆盖权重%": coverage, "结果": status})
     for attr, metric_name, label in [("max_pe", "PE", "组合最高PE"), ("max_pb", "PB", "组合最高PB")]:
         threshold = getattr(args, attr, None)
         if threshold is not None and not portfolio.empty:
             actual = to_float(portfolio.iloc[0].get(metric_name))
             coverage = to_float(portfolio.iloc[0].get(f"{metric_name}覆盖权重%"))
-            status = "数据不足" if coverage is None or coverage < args.min_metric_coverage else ("未知" if actual is None else ("通过" if actual <= threshold else "不通过"))
+            status = "数据不足" if not lookthrough_complete or coverage is None or coverage < args.min_metric_coverage else ("未知" if actual is None else ("通过" if actual <= threshold else "不通过"))
             rows.append({"约束": label, "阈值": threshold, "实际值": actual, "覆盖权重%": coverage, "结果": status})
     if args.max_sector_weight is not None and detail is not None and C_PORTFOLIO_WEIGHT in detail:
         group_col = C_SECTOR if C_SECTOR in detail and detail[C_SECTOR].fillna("").astype(str).ne("").any() else C_INDUSTRY
         exposure = detail.groupby(group_col)[C_PORTFOLIO_WEIGHT].sum() if group_col in detail else pd.Series(dtype=float)
         actual = None if exposure.empty else float(exposure.max())
-        rows.append({"约束": "单一sector最大权重", "阈值": args.max_sector_weight, "实际值": actual, "结果": "未知" if actual is None else ("通过" if actual <= args.max_sector_weight else "不通过")})
+        rows.append({"约束": "单一sector最大权重", "阈值": args.max_sector_weight, "实际值": actual, "结果": "数据不足" if not lookthrough_complete else ("未知" if actual is None else ("通过" if actual <= args.max_sector_weight else "不通过"))})
     return pd.DataFrame(rows)
 
 
 def structure_analysis(summary: pd.DataFrame, detail: pd.DataFrame) -> pd.DataFrame:
-    weights = pd.to_numeric(summary.get(C_PORTFOLIO_WEIGHT), errors="coerce").fillna(0).sort_values(ascending=False)
+    values = summary[C_PORTFOLIO_WEIGHT] if C_PORTFOLIO_WEIGHT in summary else pd.Series(dtype=float)
+    weights = pd.to_numeric(values, errors="coerce").fillna(0).sort_values(ascending=False)
     rows = [
         {"指标": "底层持仓数量", "数值": int(len(summary)), "说明": "按底层市场+ticker合并后"},
         {"指标": "组合权重合计%", "数值": float(weights.sum()), "说明": ""},
@@ -1036,7 +1424,7 @@ def output_files(full_output: bool) -> list[str]:
     return CORE_OUTPUTS + (EXTRA_OUTPUTS if full_output else [])
 
 
-def write_outputs(out_dir: Path, summary: pd.DataFrame, etf_summary: pd.DataFrame, detail: pd.DataFrame, metrics: pd.DataFrame, manifest: dict[str, Any], args: argparse.Namespace) -> None:
+def _write_outputs_direct(out_dir: Path, summary: pd.DataFrame, etf_summary: pd.DataFrame, detail: pd.DataFrame, metrics: pd.DataFrame, manifest: dict[str, Any], args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     industry = exposure_table(detail, C_INDUSTRY, "行业")
     market = exposure_table(detail, C_MARKET, "市场")
@@ -1115,6 +1503,29 @@ def write_outputs(out_dir: Path, summary: pd.DataFrame, etf_summary: pd.DataFram
         write_report_html(out_dir / OUT_HTML, summary, etf_summary, metrics)
 
 
+def write_outputs(out_dir: Path, summary: pd.DataFrame, etf_summary: pd.DataFrame, detail: pd.DataFrame, metrics: pd.DataFrame, manifest: dict[str, Any], args: argparse.Namespace) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".pcf-stage-", dir=out_dir) as tmpdir:
+        stage = Path(tmpdir)
+        _write_outputs_direct(stage, summary, etf_summary, detail, metrics, manifest, args)
+        required = [OUT_SUMMARY, OUT_DETAIL, OUT_ETF_SUMMARY, OUT_METRICS, OUT_XLSX, OUT_MANIFEST]
+        missing = [name for name in required if not (stage / name).is_file()]
+        if missing:
+            raise RuntimeError(f"staged output validation failed; missing: {', '.join(missing)}")
+
+        manifest_path = stage / OUT_MANIFEST
+        root_files = [path for path in stage.iterdir() if path.is_file() and path != manifest_path]
+        stale_targets: list[Path] = []
+        if not args.full_output:
+            stale_targets = [out_dir / name for name in EXTRA_OUTPUTS]
+
+        publish_staged_files(
+            [(path, out_dir / path.name) for path in root_files],
+            stale_targets=stale_targets,
+            commit_file=(manifest_path, out_dir / OUT_MANIFEST),
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ticker", required=True, help="US ETF tickers, e.g. QQQ.US,DRAM.US")
@@ -1122,7 +1533,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", default="us-etf-output")
     parser.add_argument("--skip-metrics", action="store_true")
     parser.add_argument("--full-output", action="store_true", help="Write auxiliary CSV, Markdown, HTML, and run_summary files. Default writes only core files.")
-    parser.add_argument("--holdings-source", choices=["auto", "issuer", "sec", "yfinance"], default="auto")
+    parser.add_argument("--holdings-source", choices=["auto", "issuer", "sec"], default="auto")
     parser.add_argument("--refresh-cache", action="store_true", help="Remove local holdings, metrics, and price cache files before running.")
     cache_group = parser.add_mutually_exclusive_group()
     cache_group.add_argument("--cache", dest="use_cache", action="store_true", default=False, help="Write holdings, metrics, and price cache files.")
@@ -1139,16 +1550,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def refresh_cache_if_requested(out_dir: Path, requested: bool) -> None:
+    if not requested:
+        return
+    cache_dir = out_dir / "cache"
+    if not cache_dir.exists():
+        return
+    for path in cache_dir.iterdir():
+        if path.is_file():
+            path.unlink()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     tickers = parse_tickers(args.ticker)
     weights = parse_weights(args.weights, len(tickers))
     out_dir = Path(args.out_dir)
+    refresh_cache_if_requested(out_dir, args.refresh_cache)
     cache_dir = out_dir / "cache" if args.use_cache else None
-    if args.refresh_cache and cache_dir is not None and cache_dir.exists():
-        for path in cache_dir.glob("*"):
-            if path.is_file():
-                path.unlink()
     summary, etf_summary, detail, sources, failed = build_tables(tickers, weights, args.holdings_source, cache_dir=cache_dir)
     detail = enrich_metrics(detail, args.skip_metrics, workers=args.metrics_workers, cache_dir=cache_dir)
     summary = rebuild_summary(detail)
@@ -1175,7 +1594,7 @@ def main(argv: list[str] | None = None) -> int:
     write_outputs(out_dir, summary, etf_summary, detail, metrics, manifest, args)
     print(f"Saved: {out_dir / OUT_XLSX}")
     print(summary.head(20).to_string(index=False))
-    return 0
+    return 1 if len(failed) == len(tickers) else 0
 
 
 if __name__ == "__main__":

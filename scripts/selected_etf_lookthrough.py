@@ -13,7 +13,9 @@ import importlib.util
 import json
 import math
 import re
+import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -26,7 +28,9 @@ from pcf_common import (
     annualized_return as common_annualized_return,
     combine_price_series,
     earnings_yield_pe as common_earnings_yield_pe,
+    normalize_price_series as common_normalize_price_series,
     price_series_metrics,
+    publish_staged_files,
     weighted_average as common_weighted_average,
 )
 from pcf_enhanced_analytics import (
@@ -155,6 +159,10 @@ class SelectedETF:
     mode: str
 
 
+class NoApplicableHoldings(RuntimeError):
+    pass
+
+
 def import_module(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -181,12 +189,13 @@ def retry(callable_obj: Callable[[], Any], tries: int = 3, sleep: float = 1.2) -
 def normalize_etf_code(value: Any) -> str:
     text = str(value).strip().upper()
     if text.endswith(".US"):
-        ticker = re.sub(r"[^A-Z0-9.\-]", "", text[:-3])
-        if ticker:
+        ticker = text[:-3]
+        if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", ticker):
             return f"{ticker}.US"
-    code = re.sub(r"\D", "", text)
-    if not code:
+    match = re.fullmatch(r"(\d{1,6})(?:\.0)?", text)
+    if not match:
         raise ValueError(f"Invalid ETF code: {value!r}")
+    code = match.group(1)
     return code.zfill(6)
 
 
@@ -194,6 +203,8 @@ def parse_codes(raw: str) -> list[str]:
     codes = [normalize_etf_code(item) for item in re.split(r"[,;\s]+", raw.strip()) if item.strip()]
     if not codes:
         raise ValueError("No ETF codes were supplied.")
+    if len(set(codes)) != len(codes):
+        raise ValueError("Duplicate ETF codes are not allowed; combine their weights before running.")
     return codes
 
 
@@ -203,6 +214,8 @@ def parse_weights(raw: str | None, count: int) -> list[float]:
     values = [float(item) for item in re.split(r"[,;\s]+", raw.strip()) if item.strip()]
     if len(values) != count:
         raise ValueError(f"--weights count ({len(values)}) must match ETF count ({count}).")
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError("--weights must contain only finite numbers.")
     if any(value < 0 for value in values):
         raise ValueError("--weights cannot contain negative values.")
     total = sum(values)
@@ -307,6 +320,8 @@ def get_a_stock_holdings(a_module: Any, etf: str) -> tuple[pd.DataFrame, dict[st
     result[C_ETF_INNER_WEIGHT] = pd.to_numeric(result[C_ETF_INNER_WEIGHT], errors="coerce")
     result[C_STOCK_PRICE] = pd.to_numeric(result[C_STOCK_PRICE], errors="coerce")
     result = result.dropna(subset=[C_ETF_INNER_WEIGHT])
+    if result.empty:
+        raise NoApplicableHoldings("A-share parser returned no weighted A-share stock rows")
     meta = {
         C_PERIOD: period,
         C_SOURCE: source,
@@ -333,6 +348,8 @@ def get_hk_stock_holdings(hk_module: Any, etf: str) -> tuple[pd.DataFrame, dict[
     result.rename(columns={C_HK_WEIGHT: C_ETF_INNER_WEIGHT}, inplace=True)
     result[C_ETF_INNER_WEIGHT] = pd.to_numeric(result[C_ETF_INNER_WEIGHT], errors="coerce")
     result = result.dropna(subset=[C_ETF_INNER_WEIGHT])
+    if result.empty:
+        raise NoApplicableHoldings("HK parser returned no weighted Hong Kong stock rows")
     meta = {
         C_PERIOD: period,
         C_SOURCE: "pcf_lookthrough",
@@ -365,7 +382,7 @@ def get_us_stock_holdings(us_module: Any, etf: str) -> tuple[pd.DataFrame, dict[
     result[C_STOCK_PRICE] = pd.to_numeric(result[C_STOCK_PRICE], errors="coerce")
     result = result.dropna(subset=[C_ETF_INNER_WEIGHT])
     if result.empty:
-        raise RuntimeError("US parser returned no weighted US stock rows")
+        raise NoApplicableHoldings("US parser returned no weighted US stock rows")
     meta = {
         C_PERIOD: period,
         C_SOURCE: source,
@@ -386,7 +403,11 @@ def get_us_listed_stock_holdings(us_listed_module: Any, etf: str) -> tuple[pd.Da
         raise RuntimeError(f"No US-listed ETF holdings for {etf}: {failed}")
     result = pd.DataFrame(
         {
-            C_STOCK_CODE: detail[us_listed_module.C_STOCK_CODE].astype(str).map(us_listed_module.normalize_us_ticker),
+            C_STOCK_CODE: detail[us_listed_module.C_STOCK_CODE].astype(str).map(
+                lambda value: value
+                if value.upper().startswith(("CUSIP:", "UNMAPPED:"))
+                else us_listed_module.normalize_us_ticker(value)
+            ),
             C_STOCK_NAME: detail[us_listed_module.C_STOCK_NAME],
             C_MARKET: detail[us_listed_module.C_MARKET],
             C_ETF_INNER_WEIGHT: pd.to_numeric(detail[us_listed_module.C_INNER_WEIGHT], errors="coerce"),
@@ -396,6 +417,8 @@ def get_us_listed_stock_holdings(us_listed_module: Any, etf: str) -> tuple[pd.Da
             C_VALUATION_ERROR: detail.get(us_listed_module.C_VAL_ERROR, ""),
         }
     ).dropna(subset=[C_ETF_INNER_WEIGHT])
+    if result.empty:
+        raise RuntimeError(f"No weighted US-listed ETF holdings for {etf}")
     row = etf_summary.iloc[0] if not etf_summary.empty else {}
     meta = {
         C_PERIOD: row.get(us_listed_module.C_PERIOD, ""),
@@ -434,26 +457,57 @@ def resolve_holdings(
     errors: dict[str, str] = {}
     try:
         hk_df, hk_meta = get_hk_stock_holdings(hk_module, selected.code)
-        if not hk_df.empty and hk_meta["\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%"] >= min_auto_weight:
-            return hk_df, hk_meta
         candidates.append((hk_df, hk_meta))
+    except NoApplicableHoldings:
+        pass
     except Exception as exc:  # noqa: BLE001
         errors["HK"] = str(exc)
 
     try:
         a_df, a_meta = get_a_stock_holdings(a_module, selected.code)
         candidates.append((a_df, a_meta))
+    except NoApplicableHoldings:
+        pass
     except Exception as exc:  # noqa: BLE001
         errors["A"] = str(exc)
 
     try:
         us_df, us_meta = get_us_stock_holdings(us_module, selected.code)
         candidates.append((us_df, us_meta))
+    except NoApplicableHoldings:
+        pass
     except Exception as exc:  # noqa: BLE001
         errors["US"] = str(exc)
 
+    candidates = [(frame, meta) for frame, meta in candidates if not frame.empty]
     if candidates:
-        return max(candidates, key=lambda item: item[1].get("\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%", 0) or 0)
+        combined = pd.concat([frame for frame, _ in candidates], ignore_index=True)
+        if {C_MARKET, C_STOCK_CODE}.issubset(combined.columns):
+            combined = combined.drop_duplicates([C_MARKET, C_STOCK_CODE], keep="first").reset_index(drop=True)
+        total_weight = float(pd.to_numeric(combined[C_ETF_INNER_WEIGHT], errors="coerce").fillna(0).sum())
+        if total_weight < min_auto_weight:
+            details = "; ".join(f"{market} parser: {error}" for market, error in errors.items())
+            raise RuntimeError(
+                f"auto mode resolved only {total_weight:.2f}% stock weight, below {min_auto_weight:.2f}%."
+                + (f" {details}" if details else "")
+            )
+        periods = sorted({str(meta.get(C_PERIOD) or "") for _, meta in candidates if meta.get(C_PERIOD)})
+        sources = sorted({str(meta.get(C_SOURCE) or "") for _, meta in candidates if meta.get(C_SOURCE)})
+        names = [str(meta.get(C_ETF_NAME) or "") for _, meta in candidates if meta.get(C_ETF_NAME)]
+        parser_errors = "; ".join(f"{market} parser: {error}" for market, error in errors.items())
+        meta = {
+            C_ETF_NAME: names[0] if names else "",
+            C_MODE: "auto",
+            C_PERIOD: ";".join(periods),
+            C_SOURCE: ";".join(sources),
+            C_STOCK_COUNT: len(combined),
+            C_RAW_STOCK_ROWS: sum(int(meta.get(C_RAW_STOCK_ROWS, len(frame)) or 0) for frame, meta in candidates),
+            C_EFFECTIVE_STOCK_ROWS: len(combined),
+            C_MISSING_WEIGHT_ROWS: sum(int(meta.get(C_MISSING_WEIGHT_ROWS, 0) or 0) for _, meta in candidates),
+            "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%": total_weight,
+            C_ERROR: f"auto mode incomplete: {parser_errors}" if parser_errors else "",
+        }
+        return combined, meta
     raise RuntimeError("auto mode failed. " + "; ".join(f"{market} parser: {error}" for market, error in errors.items()))
 
 
@@ -658,12 +712,17 @@ def selected_price_series(selected: SelectedETF, ak_module: Any, us_listed_modul
             raise RuntimeError("us_listed mode requires --us-listed-script for return metrics")
         ticker = us_listed_module.normalize_us_ticker(selected.code)
         series, source = us_listed_module.price_series(ticker, lookback_days, cache_dir=None)
+        series = common_normalize_price_series(series)
         if len(series) < 30:
             raise RuntimeError(f"{source}: {len(series)} observations")
         if not hasattr(us_listed_module, "fx_series"):
             raise RuntimeError("US-listed ETF return conversion requires USD/CNY history")
         fx, fx_source = us_listed_module.fx_series(lookback_days, cache_dir=None)
-        aligned = pd.concat([series.rename("etf"), fx.rename("fx")], axis=1, sort=True).sort_index().ffill().dropna()
+        fx = common_normalize_price_series(fx)
+        if fx.empty:
+            raise RuntimeError("USD/CNY return series is empty")
+        common_end = min(series.index[-1], fx.index[-1])
+        aligned = pd.concat([series.rename("etf"), fx.rename("fx")], axis=1, sort=True).sort_index().loc[:common_end].ffill().dropna()
         if len(aligned) < 30:
             raise RuntimeError("USD/CNY-aligned return series is too short")
         return aligned["etf"] * aligned["fx"], f"{source}*{fx_source}"
@@ -911,7 +970,7 @@ def build_tables(
                 C_RAW_STOCK_ROWS: meta.get(C_RAW_STOCK_ROWS, meta[C_STOCK_COUNT]),
                 C_EFFECTIVE_STOCK_ROWS: meta.get(C_EFFECTIVE_STOCK_ROWS, meta[C_STOCK_COUNT]),
                 C_MISSING_WEIGHT_ROWS: meta.get(C_MISSING_WEIGHT_ROWS, 0),
-                C_ERROR: "",
+                C_ERROR: str(meta.get(C_ERROR) or ""),
                 "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%": meta[
                     "\u0045\u0054\u0046\u5185\u80a1\u7968\u6743\u91cd\u5408\u8ba1%"
                 ],
@@ -921,8 +980,7 @@ def build_tables(
     detail = pd.DataFrame(detail_rows)
     etf_summary = pd.DataFrame(etf_rows)
     if detail.empty:
-        failures = "; ".join(f"{row.get(C_ETF_CODE)}: {row.get(C_ERROR)}" for row in etf_rows)
-        raise RuntimeError(f"No selected ETF holdings completed. {failures}")
+        return pd.DataFrame(), detail, etf_summary
     summary = (
         detail.groupby([C_UNDERLYING_MARKET, C_STOCK_CODE], as_index=False)
         .agg(
@@ -998,36 +1056,45 @@ def add_metrics_to_tables(
     hk_alt_limit: int,
     hk_sleep: float,
     lookback_days: int,
+    skip_metrics: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if detail.empty:
-        return summary, detail, etf_summary, pd.DataFrame()
-
-    print("Looking up stock-level PE/PB/dividend yield...")
-    detail = enrich_detail_stock_metrics(
-        detail,
-        a_module=a_module,
-        hk_module=hk_module,
-        us_module=us_module,
-        us_listed_module=us_listed_module,
-        workers=workers,
-        hk_alt_limit=hk_alt_limit,
-        hk_sleep=hk_sleep,
-    )
+    if not skip_metrics:
+        print("Looking up stock-level PE/PB/dividend yield...")
+        detail = enrich_detail_stock_metrics(
+            detail,
+            a_module=a_module,
+            hk_module=hk_module,
+            us_module=us_module,
+            us_listed_module=us_listed_module,
+            workers=workers,
+            hk_alt_limit=hk_alt_limit,
+            hk_sleep=hk_sleep,
+        )
     summary = rebuild_summary_from_detail(detail)
 
     ak_module = getattr(a_module, "ak", None) or getattr(hk_module, "ak", None) or getattr(us_module, "ak", None)
     metric_rows: list[dict[str, Any]] = []
     etf_summary = etf_summary.copy()
     for idx, etf_row in etf_summary.iterrows():
-        etf = str(etf_row[C_ETF_CODE]).zfill(6)
-        etf_detail = detail[detail[C_ETF_CODE].astype(str).str.zfill(6).eq(etf)]
+        etf = normalize_etf_code(etf_row[C_ETF_CODE])
+        normalized_detail_codes = (
+            detail[C_ETF_CODE].map(normalize_etf_code)
+            if C_ETF_CODE in detail.columns
+            else pd.Series(dtype=str, index=detail.index)
+        )
+        etf_detail = detail[normalized_detail_codes.eq(etf)]
         valuation = aggregate_valuation_rows(valuation_rows_from_detail(etf_detail, C_ETF_INNER_WEIGHT))
         mode = str(etf_row.get(C_MODE) or "")
-        holding_error = str(etf_row.get(C_ERROR) or "")
+        error_value = etf_row.get(C_ERROR)
+        holding_error = "" if error_value is None or pd.isna(error_value) else str(error_value)
         returns = (
             {C_RETURN_SOURCE: "", C_RETURN_ERROR: holding_error}
             if holding_error
-            else safe_selected_return_metrics(SelectedETF(etf, 1.0, mode), ak_module, us_listed_module, lookback_days=lookback_days)
+            else (
+                {}
+                if skip_metrics
+                else safe_selected_return_metrics(SelectedETF(etf, 1.0, mode), ak_module, us_listed_module, lookback_days=lookback_days)
+            )
         )
         for key, value in {**valuation, **returns}.items():
             etf_summary.at[idx, key] = value
@@ -1042,6 +1109,9 @@ def add_metrics_to_tables(
                 C_SOURCE: etf_row.get(C_SOURCE),
                 C_LOOKTHROUGH_BASIS: etf_row.get(C_LOOKTHROUGH_BASIS),
                 C_STOCK_COUNT: etf_row.get(C_STOCK_COUNT),
+                C_RAW_STOCK_ROWS: etf_row.get(C_RAW_STOCK_ROWS),
+                C_EFFECTIVE_STOCK_ROWS: etf_row.get(C_EFFECTIVE_STOCK_ROWS),
+                C_MISSING_WEIGHT_ROWS: etf_row.get(C_MISSING_WEIGHT_ROWS),
                 C_ERROR: holding_error,
                 **valuation,
                 **returns,
@@ -1049,7 +1119,19 @@ def add_metrics_to_tables(
         )
 
     portfolio_valuation = aggregate_valuation_rows(valuation_rows_from_detail(detail, C_PORTFOLIO_WEIGHT))
-    portfolio_returns = portfolio_return_metrics(selections, ak_module, us_listed_module, lookback_days=lookback_days) if ak_module is not None or us_listed_module is not None else {}
+    portfolio_returns = (
+        {}
+        if skip_metrics
+        else (portfolio_return_metrics(selections, ak_module, us_listed_module, lookback_days=lookback_days) if ak_module is not None or us_listed_module is not None else {})
+    )
+    holding_errors = {
+        str(row.get(C_ETF_CODE)): str(row.get(C_ERROR))
+        for _, row in etf_summary.iterrows()
+        if row.get(C_ERROR) is not None and not pd.isna(row.get(C_ERROR)) and str(row.get(C_ERROR)).strip()
+    }
+    raw_rows = pd.to_numeric(etf_summary.get(C_RAW_STOCK_ROWS, pd.Series(dtype=float)), errors="coerce").fillna(0)
+    effective_rows = pd.to_numeric(etf_summary.get(C_EFFECTIVE_STOCK_ROWS, pd.Series(dtype=float)), errors="coerce").fillna(0)
+    missing_rows = pd.to_numeric(etf_summary.get(C_MISSING_WEIGHT_ROWS, pd.Series(dtype=float)), errors="coerce").fillna(0)
     metric_rows.append(
         {
             C_TYPE: "\u7ec4\u5408",
@@ -1057,9 +1139,18 @@ def add_metrics_to_tables(
             C_ETF_NAME: ",".join(selected.code for selected in selections),
             C_ETF_WEIGHT: 100.0,
             C_MODE: "\u7ec4\u5408\u7a7f\u900f",
-            C_PERIOD: ",".join(sorted(str(x) for x in detail[C_PERIOD].dropna().unique())),
-            C_SOURCE: ",".join(sorted(str(x) for x in detail[C_SOURCE].dropna().unique())),
+            C_PERIOD: ",".join(
+                sorted(str(x) for x in detail.get(C_PERIOD, pd.Series(dtype=str)).dropna().unique())
+            ),
+            C_SOURCE: ",".join(
+                sorted(str(x) for x in detail.get(C_SOURCE, pd.Series(dtype=str)).dropna().unique())
+            ),
+            C_LOOKTHROUGH_BASIS: ",".join(sorted(str(x) for x in etf_summary.get(C_LOOKTHROUGH_BASIS, pd.Series(dtype=str)).dropna().unique())),
             C_STOCK_COUNT: int(len(summary)),
+            C_RAW_STOCK_ROWS: int(raw_rows.sum()),
+            C_EFFECTIVE_STOCK_ROWS: int(effective_rows.sum()),
+            C_MISSING_WEIGHT_ROWS: int(missing_rows.sum()),
+            C_ERROR: json.dumps(holding_errors, ensure_ascii=False) if holding_errors else "",
             **portfolio_valuation,
             **portfolio_returns,
         }
@@ -1075,6 +1166,9 @@ def add_metrics_to_tables(
         C_SOURCE,
         C_LOOKTHROUGH_BASIS,
         C_STOCK_COUNT,
+        C_RAW_STOCK_ROWS,
+        C_EFFECTIVE_STOCK_ROWS,
+        C_MISSING_WEIGHT_ROWS,
         C_HOLDING_WEIGHT_TOTAL,
         C_DIVIDEND_YIELD,
         "PE",
@@ -1138,7 +1232,7 @@ def refresh_cache_if_requested(out_dir: Path, args: argparse.Namespace) -> None:
             path.unlink()
 
 
-def write_outputs(
+def _write_outputs_direct(
     out_dir: Path,
     summary: pd.DataFrame,
     detail: pd.DataFrame,
@@ -1147,7 +1241,6 @@ def write_outputs(
     args: argparse.Namespace,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    refresh_cache_if_requested(out_dir, args)
     summary.to_csv(out_dir / OUT_SUMMARY, index=False, encoding="utf-8-sig")
     detail.to_csv(out_dir / OUT_DETAIL, index=False, encoding="utf-8-sig")
     etf_summary.to_csv(out_dir / OUT_ETF_SUMMARY, index=False, encoding="utf-8-sig")
@@ -1222,6 +1315,53 @@ def write_outputs(
                         cell.number_format = "0.0000"
 
 
+def write_outputs(
+    out_dir: Path,
+    summary: pd.DataFrame,
+    detail: pd.DataFrame,
+    etf_summary: pd.DataFrame,
+    metrics_summary: pd.DataFrame,
+    args: argparse.Namespace,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    refresh_cache_if_requested(out_dir, args)
+    with tempfile.TemporaryDirectory(prefix=".pcf-stage-", dir=out_dir) as tmpdir:
+        stage = Path(tmpdir)
+        existing_cache = out_dir / "cache"
+        if getattr(args, "use_cache", False) and existing_cache.exists():
+            stage_cache = stage / "cache"
+            stage_cache.mkdir(parents=True, exist_ok=True)
+            for path in existing_cache.glob("holdings_*.csv"):
+                if path.is_file():
+                    shutil.copy2(path, stage_cache / path.name)
+        _write_outputs_direct(stage, summary, detail, etf_summary, metrics_summary, args)
+        required = [OUT_SUMMARY, OUT_DETAIL, OUT_ETF_SUMMARY, OUT_METRICS, OUT_XLSX, "run_manifest.json"]
+        missing = [name for name in required if not (stage / name).is_file()]
+        if missing:
+            raise RuntimeError(f"staged output validation failed; missing: {', '.join(missing)}")
+
+        manifest = stage / "run_manifest.json"
+        root_files = [path for path in stage.iterdir() if path.is_file() and path != manifest]
+        stage_cache = stage / "cache"
+        cache_files = [path for path in stage_cache.iterdir() if path.is_file()] if stage_cache.exists() else []
+        stale_targets: list[Path] = []
+        if not args.full_output:
+            stale_names = {
+                OUT_JSON,
+                OUT_MARKDOWN,
+                OUT_HTML,
+                *ENHANCED_CSV_OUTPUTS.values(),
+            }
+            stale_targets = [out_dir / name for name in stale_names]
+
+        publish_staged_files(
+            [(path, out_dir / path.name) for path in root_files]
+            + [(path, out_dir / "cache" / path.name) for path in cache_files],
+            stale_targets=stale_targets,
+            commit_file=(manifest, out_dir / manifest.name),
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--etf", required=True, help="ETF codes separated by comma/space, e.g. 159569,159758")
@@ -1240,7 +1380,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-auto-weight",
         type=float,
         default=30.0,
-        help="In auto mode, accept HK parser when HK stock weight is at least this percent.",
+        help="Minimum combined A/HK/US stock weight required for auto mode.",
     )
     parser.add_argument("--skip-metrics", action="store_true", help="Only export holdings weights; skip PE/PB/dividend/return lookups.")
     parser.add_argument("--metrics-workers", type=int, default=8, help="Concurrent A-share stock metric lookups.")
@@ -1270,9 +1410,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.full_output = args.full_output or any(
         (args.compare, args.industry, args.theme, args.risk, args.html_report)
     )
@@ -1291,22 +1431,21 @@ def main() -> int:
         name_map=name_map,
         min_auto_weight=args.min_auto_weight,
     )
-    metrics_summary = pd.DataFrame(columns=[C_TYPE, C_ETF_CODE])
-    if not args.skip_metrics:
-        summary, detail, etf_summary, metrics_summary = add_metrics_to_tables(
-            selections,
-            summary=summary,
-            detail=detail,
-            etf_summary=etf_summary,
-            a_module=a_module,
-            hk_module=hk_module,
-            us_module=us_module,
-            us_listed_module=us_listed_module,
-            workers=args.metrics_workers,
-            hk_alt_limit=args.hk_alt_limit,
-            hk_sleep=args.hk_sleep,
-            lookback_days=args.nav_lookback_days,
-        )
+    summary, detail, etf_summary, metrics_summary = add_metrics_to_tables(
+        selections,
+        summary=summary,
+        detail=detail,
+        etf_summary=etf_summary,
+        a_module=a_module,
+        hk_module=hk_module,
+        us_module=us_module,
+        us_listed_module=us_listed_module,
+        workers=max(1, args.metrics_workers),
+        hk_alt_limit=max(0, args.hk_alt_limit),
+        hk_sleep=max(0.0, args.hk_sleep),
+        lookback_days=max(60, args.nav_lookback_days),
+        skip_metrics=args.skip_metrics,
+    )
     out_dir = Path(args.out_dir)
     write_outputs(out_dir, summary, detail, etf_summary, metrics_summary, args)
     print(f"Saved: {out_dir / OUT_SUMMARY}")
@@ -1321,7 +1460,8 @@ def main() -> int:
     if not summary.empty:
         print("\nTop look-through holdings:")
         print(summary.head(15).to_string(index=False))
-    return 0
+    failures = etf_summary.get(C_ERROR, pd.Series(dtype=str)).fillna("").astype(str).str.strip().ne("")
+    return 1 if len(etf_summary) > 0 and bool(failures.all()) else 0
 
 
 if __name__ == "__main__":

@@ -3,14 +3,91 @@
 from __future__ import annotations
 
 import math
+import shutil
+import tempfile
 from datetime import date
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterable
 
 import pandas as pd
 
 
 TRADING_DAYS_PER_YEAR = 252
 CALENDAR_DAYS_PER_YEAR = 365.25
+
+
+def _replace_file(source: Path, target: Path) -> None:
+    source.replace(target)
+
+
+def publish_staged_files(
+    staged_files: list[tuple[Path, Path]],
+    *,
+    stale_targets: Iterable[Path] = (),
+    commit_file: tuple[Path, Path] | None = None,
+) -> None:
+    """Publish a validated file set and restore the previous set on failure."""
+    stale = list(stale_targets)
+    actions = list(staged_files)
+    if commit_file is not None:
+        actions.append(commit_file)
+    if not actions and not stale:
+        return
+
+    missing = [str(source) for source, _ in actions if not source.is_file()]
+    if missing:
+        raise RuntimeError(f"staged files missing: {', '.join(missing)}")
+
+    targets = [target for _, target in actions] + stale
+    seen: set[str] = set()
+    for target in targets:
+        key = str(target.absolute()).casefold()
+        if key in seen:
+            raise RuntimeError(f"duplicate publication target: {target}")
+        seen.add(key)
+
+    backup_parent = (actions[0][1] if actions else stale[0]).parent
+    backup_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".pcf-backup-", dir=backup_parent) as tmpdir:
+        backup_dir = Path(tmpdir)
+        backups: dict[Path, Path] = {}
+        for index, target in enumerate(targets):
+            if target.is_file():
+                backup = backup_dir / f"{index:04d}.bak"
+                shutil.copy2(target, backup)
+                backups[target] = backup
+
+        mutated: list[Path] = []
+        try:
+            for source, target in staged_files:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _replace_file(source, target)
+                mutated.append(target)
+            for target in stale:
+                if target.is_file():
+                    target.unlink()
+                    mutated.append(target)
+            if commit_file is not None:
+                source, target = commit_file
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _replace_file(source, target)
+                mutated.append(target)
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            for target in reversed(mutated):
+                try:
+                    backup = backups.get(target)
+                    if backup is not None and backup.is_file():
+                        _replace_file(backup, target)
+                    elif target.is_file():
+                        target.unlink()
+                except Exception as rollback_exc:  # noqa: BLE001
+                    rollback_errors.append(f"{target}: {rollback_exc}")
+            if rollback_errors:
+                raise RuntimeError(
+                    f"output publication failed ({exc}); rollback also failed: {'; '.join(rollback_errors)}"
+                ) from exc
+            raise
 
 
 def is_missing(value: Any) -> bool:
@@ -98,15 +175,25 @@ def normalize_price_frame(df: pd.DataFrame, date_col: str, value_col: str) -> pd
     temp.columns = ["date", "value"]
     temp["date"] = pd.to_datetime(temp["date"], errors="coerce")
     temp["value"] = pd.to_numeric(temp["value"], errors="coerce")
-    return temp.dropna().sort_values("date")
+    temp = temp.dropna()
+    if getattr(temp["date"].dt, "tz", None) is not None:
+        temp["date"] = temp["date"].dt.tz_localize(None)
+    temp["date"] = temp["date"].dt.normalize()
+    temp = temp[temp["value"] > 0]
+    return temp.sort_values("date").drop_duplicates("date", keep="last")
 
 
 def normalize_price_series(series: pd.Series) -> pd.Series:
     temp = pd.Series(series, copy=True)
     temp.index = pd.to_datetime(temp.index, errors="coerce")
+    if isinstance(temp.index, pd.DatetimeIndex):
+        if temp.index.tz is not None:
+            temp.index = temp.index.tz_localize(None)
+        temp.index = temp.index.normalize()
     temp = pd.to_numeric(temp, errors="coerce")
     temp = temp[temp.index.notna() & temp.notna()].sort_index()
-    return temp[~temp.index.duplicated(keep="last")].astype(float)
+    temp = temp[~temp.index.duplicated(keep="last")].astype(float)
+    return temp[temp > 0]
 
 
 def trailing_return_pct(series: pd.Series, days_back: int, min_days: int) -> float | None:
@@ -116,12 +203,11 @@ def trailing_return_pct(series: pd.Series, days_back: int, min_days: int) -> flo
     last_date = series.index[-1]
     target = last_date - pd.Timedelta(days=days_back)
     eligible = series[series.index <= target]
-    if eligible.empty:
-        return None
-    first_date = eligible.index[-1]
+    first_date = eligible.index[-1] if not eligible.empty else series.index[0]
     if (last_date - first_date).days < min_days:
         return None
-    first, last = float(eligible.iloc[-1]), float(series.iloc[-1])
+    first = float(eligible.iloc[-1] if not eligible.empty else series.iloc[0])
+    last = float(series.iloc[-1])
     return None if first <= 0 or last <= 0 else (last / first - 1.0) * 100
 
 
@@ -152,9 +238,10 @@ def price_series_metrics(series: pd.Series) -> dict[str, Any]:
 
     one_year_target = last_date - pd.Timedelta(days=365)
     eligible = series[series.index <= one_year_target]
-    if not eligible.empty and (last_date - eligible.index[-1]).days >= 330:
-        first_date = eligible.index[-1]
-        first, last = float(eligible.iloc[-1]), float(series.iloc[-1])
+    first_date = eligible.index[-1] if not eligible.empty else series.index[0]
+    if (last_date - first_date).days >= 330:
+        first = float(eligible.iloc[-1] if not eligible.empty else series.iloc[0])
+        last = float(series.iloc[-1])
         annualized = annualized_return(first, last, first_date.date(), last_date.date())
         result["annualized_return_pct"] = None if annualized is None else annualized * 100
         result["return_window"] = f"{first_date.date()} to {last_date.date()}"
@@ -191,18 +278,22 @@ def price_series_metrics(series: pd.Series) -> dict[str, Any]:
 
 
 def combine_price_series(series_map: dict[str, pd.Series], weights: dict[str, float]) -> pd.Series:
-    if not series_map:
+    requested = [code for code, weight in weights.items() if weight > 0]
+    if not requested or any(code not in series_map for code in requested):
         return pd.Series(dtype=float)
+    cleaned = {code: normalize_price_series(series_map[code]) for code in requested}
+    if any(series.empty for series in cleaned.values()):
+        return pd.Series(dtype=float)
+    common_end = min(series.index[-1] for series in cleaned.values())
     prices = pd.concat(
-        {code: normalize_price_series(series) for code, series in series_map.items()},
+        cleaned,
         axis=1,
         sort=True,
-    ).sort_index().ffill().dropna()
+    ).sort_index().loc[:common_end].ffill().dropna()
     if prices.empty:
         return pd.Series(dtype=float)
-    usable = [code for code in weights if code in prices.columns]
-    total = sum(weights[code] for code in usable)
+    total = sum(weights[code] for code in requested)
     if total <= 0:
         return pd.Series(dtype=float)
-    normalized = prices[usable].div(prices[usable].iloc[0])
-    return sum(normalized[code] * weights[code] / total for code in usable)
+    normalized = prices[requested].div(prices[requested].iloc[0])
+    return sum(normalized[code] * weights[code] / total for code in requested)
